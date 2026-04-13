@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import tifffile
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtWidgets import (
@@ -1008,6 +1010,9 @@ class UltrackAnalysisWidget(QWidget):
         self._tr_seg_run_btn = QPushButton("Run Segmentation")
         self._tr_seg_run_btn.clicked.connect(self._tr_on_run_segmentation)
         row.addWidget(self._tr_seg_run_btn)
+        self._tr_seg_term_btn = QPushButton("Run in Terminal")
+        self._tr_seg_term_btn.clicked.connect(self._tr_on_run_seg_terminal)
+        row.addWidget(self._tr_seg_term_btn)
         self._tr_seg_cancel_btn = QPushButton("Cancel")
         self._tr_seg_cancel_btn.setEnabled(False)
         self._tr_seg_cancel_btn.clicked.connect(self._tr_on_seg_cancel)
@@ -1072,6 +1077,9 @@ class UltrackAnalysisWidget(QWidget):
         self._tr_lnk_run_btn = QPushButton("Run Linking")
         self._tr_lnk_run_btn.clicked.connect(self._tr_on_run_linking)
         row.addWidget(self._tr_lnk_run_btn)
+        self._tr_lnk_term_btn = QPushButton("Run in Terminal")
+        self._tr_lnk_term_btn.clicked.connect(self._tr_on_run_lnk_terminal)
+        row.addWidget(self._tr_lnk_term_btn)
         self._tr_lnk_cancel_btn = QPushButton("Cancel")
         self._tr_lnk_cancel_btn.setEnabled(False)
         self._tr_lnk_cancel_btn.clicked.connect(self._tr_on_lnk_cancel)
@@ -1172,6 +1180,9 @@ class UltrackAnalysisWidget(QWidget):
         self._tr_slv_run_btn = QPushButton("Run Solve")
         self._tr_slv_run_btn.clicked.connect(self._tr_on_run_solve)
         row.addWidget(self._tr_slv_run_btn)
+        self._tr_slv_term_btn = QPushButton("Run in Terminal")
+        self._tr_slv_term_btn.clicked.connect(self._tr_on_run_slv_terminal)
+        row.addWidget(self._tr_slv_term_btn)
         self._tr_slv_cancel_btn = QPushButton("Cancel")
         self._tr_slv_cancel_btn.setEnabled(False)
         self._tr_slv_cancel_btn.clicked.connect(self._tr_on_slv_cancel)
@@ -1214,6 +1225,41 @@ class UltrackAnalysisWidget(QWidget):
         lay.addWidget(self._tr_progress)
         self._tr_status = QLabel("")
         lay.addWidget(self._tr_status)
+
+        # ── Inspect DB section ───────────────────────────────────────────
+        db_grp = QGroupBox("Inspect Database")
+        db_lay = QVBoxLayout()
+
+        row = QHBoxLayout()
+        self._db_load_candidates_btn = QPushButton("Load Candidates")
+        self._db_load_candidates_btn.clicked.connect(self._db_on_load_candidates)
+        row.addWidget(self._db_load_candidates_btn)
+        self._db_load_links_btn = QPushButton("Load Links")
+        self._db_load_links_btn.clicked.connect(self._db_on_load_links)
+        row.addWidget(self._db_load_links_btn)
+        self._db_load_divisions_btn = QPushButton("Load Divisions")
+        self._db_load_divisions_btn.clicked.connect(self._db_on_load_divisions)
+        row.addWidget(self._db_load_divisions_btn)
+        db_lay.addLayout(row)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Colour candidates by:"))
+        self._db_colour_by_combo = QComboBox()
+        self._db_colour_by_combo.addItems(["selected", "area", "node_prob", "frontier", "height"])
+        self._db_colour_by_combo.setEnabled(False)
+        self._db_colour_by_combo.currentTextChanged.connect(self._db_on_colour_by_changed)
+        row.addWidget(self._db_colour_by_combo)
+        row.addStretch()
+        db_lay.addLayout(row)
+
+        self._db_status = QLabel("")
+        db_lay.addWidget(self._db_status)
+
+        db_grp.setLayout(db_lay)
+        lay.addWidget(db_grp)
+
+        # Store dataframe for colour mapping
+        self._db_candidates_df = None
 
         grp.setLayout(lay)
         return grp
@@ -1321,6 +1367,73 @@ class UltrackAnalysisWidget(QWidget):
             self._tr_status.setText("Launched tracking in terminal.")
         except Exception as e:
             self._tr_status.setText(f"Terminal error: {e}")
+
+    def _tr_on_run_seg_terminal(self) -> None:
+        paths = self._get_paths()
+        if paths is None:
+            self._tr_seg_status.setText("Set input and output directories first.")
+            return
+        _, out = paths
+        fg_path = str(Path(out) / "foreground.tif")
+        ct_path = str(Path(out) / "contours.tif")
+        wd = out
+        cfg = self._tr_build_config()
+        cfg_path = Path(tempfile.mktemp(suffix="_tr_seg_config.json"))
+        cfg_path.write_text(json.dumps(cfg.model_dump(), indent=2))
+        cmd = (
+            f"python -m ultrack_wrapper.stages.s03_tracking --stage segmentation"
+            f" --foreground \"{fg_path}\""
+            f" --contours \"{ct_path}\""
+            f" --working-dir \"{wd}\""
+            f" --config \"{cfg_path}\""
+        )
+        try:
+            launch_in_terminal(cmd)
+            self._tr_seg_status.setText("Launched segmentation in terminal.")
+        except Exception as e:
+            self._tr_seg_status.setText(f"Terminal error: {e}")
+
+    def _tr_on_run_lnk_terminal(self) -> None:
+        paths = self._get_paths()
+        if paths is None:
+            self._tr_lnk_status.setText("Set input and output directories first.")
+            return
+        _, out = paths
+        wd = out
+        cfg = self._tr_build_config()
+        cfg_path = Path(tempfile.mktemp(suffix="_tr_lnk_config.json"))
+        cfg_path.write_text(json.dumps(cfg.model_dump(), indent=2))
+        cmd = (
+            f"python -m ultrack_wrapper.stages.s03_tracking --stage linking"
+            f" --working-dir \"{wd}\""
+            f" --config \"{cfg_path}\""
+        )
+        try:
+            launch_in_terminal(cmd)
+            self._tr_lnk_status.setText("Launched linking in terminal.")
+        except Exception as e:
+            self._tr_lnk_status.setText(f"Terminal error: {e}")
+
+    def _tr_on_run_slv_terminal(self) -> None:
+        paths = self._get_paths()
+        if paths is None:
+            self._tr_slv_status.setText("Set input and output directories first.")
+            return
+        _, out = paths
+        wd = out
+        cfg = self._tr_build_config()
+        cfg_path = Path(tempfile.mktemp(suffix="_tr_slv_config.json"))
+        cfg_path.write_text(json.dumps(cfg.model_dump(), indent=2))
+        cmd = (
+            f"python -m ultrack_wrapper.stages.s03_tracking --stage solve"
+            f" --working-dir \"{wd}\""
+            f" --config \"{cfg_path}\""
+        )
+        try:
+            launch_in_terminal(cmd)
+            self._tr_slv_status.setText("Launched solve in terminal.")
+        except Exception as e:
+            self._tr_slv_status.setText(f"Terminal error: {e}")
 
     def _tr_on_progress(self, u: tuple) -> None:
         done, total, label = u
@@ -1578,6 +1691,251 @@ class UltrackAnalysisWidget(QWidget):
             self._tr_status.setText(f"CTC export written to {output_dir}")
         except Exception as e:
             self._tr_status.setText(f"CTC export error: {e}")
+
+    # ── Database inspection methods ───────────────────────────────────────
+
+    def _db_on_load_candidates(self) -> None:
+        """Load all segmentation candidate nodes from the database."""
+        paths = self._get_paths()
+        if paths is None:
+            self._db_status.setText("Set input and output directories first.")
+            return
+        _, out = paths
+        wd = Path(out)
+
+        self._db_load_candidates_btn.setEnabled(False)
+        self._db_status.setText("Loading candidates…")
+
+        @thread_worker(connect={
+            "returned": self._db_candidates_on_result,
+            "errored": self._db_candidates_on_error,
+        })
+        def _work():
+            db_path = wd / "data.db"
+            if not db_path.exists():
+                raise FileNotFoundError(f"Database not found: {db_path}")
+            conn = sqlite3.connect(str(db_path))
+            query = """
+                SELECT t, z, y, x, area, node_prob, frontier, height, selected
+                FROM nodes
+                ORDER BY t, id
+            """
+            df = pd.read_sql_query(query, conn)
+            conn.close()
+            return df
+
+        self._db_worker = _work()
+
+    def _db_candidates_on_result(self, df: pd.DataFrame) -> None:
+        """Handle result from load_candidates query."""
+        self._db_load_candidates_btn.setEnabled(True)
+        self._db_candidates_df = df
+
+        if df.empty:
+            self._db_status.setText("No candidates found.")
+            return
+
+        # Create or update Points layer
+        coords = df[["t", "z", "y", "x"]].values
+        # Color by selected status: True (green) = 1, False (red) = 0
+        face_color = df["selected"].astype(int).values
+
+        layer_name = "candidates"
+        if layer_name in self.viewer.layers:
+            layer = self.viewer.layers[layer_name]
+            layer.data = coords
+            layer.face_color = face_color
+        else:
+            self.viewer.add_points(
+                coords,
+                face_color=face_color,
+                name=layer_name,
+                size=5,
+                opacity=0.8,
+            )
+
+        self._db_colour_by_combo.setEnabled(True)
+        self._db_status.setText(f"Loaded {len(df)} candidates (green=selected, red=rejected)")
+
+    def _db_candidates_on_error(self, exc: Exception) -> None:
+        """Handle error from load_candidates query."""
+        self._db_load_candidates_btn.setEnabled(True)
+        self._db_status.setText(f"Error loading candidates: {exc}")
+
+    def _db_on_load_links(self) -> None:
+        """Load all candidate links as vectors."""
+        paths = self._get_paths()
+        if paths is None:
+            self._db_status.setText("Set input and output directories first.")
+            return
+        _, out = paths
+        wd = Path(out)
+
+        self._db_load_links_btn.setEnabled(False)
+        self._db_status.setText("Loading links…")
+
+        @thread_worker(connect={
+            "returned": self._db_links_on_result,
+            "errored": self._db_links_on_error,
+        })
+        def _work():
+            db_path = wd / "data.db"
+            if not db_path.exists():
+                raise FileNotFoundError(f"Database not found: {db_path}")
+            conn = sqlite3.connect(str(db_path))
+            query = """
+                SELECT n1.t, n1.z, n1.y, n1.x,
+                       n2.z - n1.z as dz, n2.y - n1.y as dy, n2.x - n1.x as dx,
+                       l.weight
+                FROM links l
+                JOIN nodes n1 ON l.source_id = n1.id
+                JOIN nodes n2 ON l.target_id = n2.id
+            """
+            df = pd.read_sql_query(query, conn)
+            conn.close()
+            return df
+
+        self._db_worker = _work()
+
+    def _db_links_on_result(self, df: pd.DataFrame) -> None:
+        """Handle result from load_links query."""
+        self._db_load_links_btn.setEnabled(True)
+
+        if df.empty:
+            self._db_status.setText("No links found.")
+            return
+
+        # Create vectors in napari format: (N, 2, D) where D is spatial dims
+        # First row: start position [z, y, x]
+        # Second row: direction [dz, dy, dx]
+        starts = df[["z", "y", "x"]].values  # (N, 3)
+        directions = df[["dz", "dy", "dx"]].values  # (N, 3)
+        vectors = np.stack([starts, directions], axis=1)  # (N, 2, 3)
+
+        # Normalize edge width by weight (0 to 1)
+        weights = df["weight"].values
+        if weights.size > 0:
+            w_min, w_max = weights.min(), weights.max()
+            if w_max > w_min:
+                edge_width = (weights - w_min) / (w_max - w_min) * 10 + 0.5
+            else:
+                edge_width = np.ones_like(weights) * 5
+        else:
+            edge_width = np.ones_like(weights)
+
+        layer_name = "candidate_links"
+        if layer_name in self.viewer.layers:
+            layer = self.viewer.layers[layer_name]
+            layer.data = vectors
+            layer.edge_width = edge_width
+        else:
+            self.viewer.add_vectors(
+                vectors,
+                edge_width=edge_width,
+                name=layer_name,
+                edge_color="yellow",
+                opacity=0.7,
+            )
+
+        self._db_status.setText(f"Loaded {len(df)} candidate links")
+
+    def _db_links_on_error(self, exc: Exception) -> None:
+        """Handle error from load_links query."""
+        self._db_load_links_btn.setEnabled(True)
+        self._db_status.setText(f"Error loading links: {exc}")
+
+    def _db_on_load_divisions(self) -> None:
+        """Load division events (parent nodes with ≥2 selected children)."""
+        paths = self._get_paths()
+        if paths is None:
+            self._db_status.setText("Set input and output directories first.")
+            return
+        _, out = paths
+        wd = Path(out)
+
+        self._db_load_divisions_btn.setEnabled(False)
+        self._db_status.setText("Loading divisions…")
+
+        @thread_worker(connect={
+            "returned": self._db_divisions_on_result,
+            "errored": self._db_divisions_on_error,
+        })
+        def _work():
+            db_path = wd / "data.db"
+            if not db_path.exists():
+                raise FileNotFoundError(f"Database not found: {db_path}")
+            conn = sqlite3.connect(str(db_path))
+            query = """
+                SELECT DISTINCT n.t, n.z, n.y, n.x
+                FROM nodes n
+                WHERE n.selected = 1
+                AND (
+                    SELECT COUNT(DISTINCT l.target_id)
+                    FROM links l
+                    JOIN nodes n_child ON l.target_id = n_child.id
+                    WHERE l.source_id = n.id AND n_child.selected = 1
+                ) >= 2
+            """
+            df = pd.read_sql_query(query, conn)
+            conn.close()
+            return df
+
+        self._db_worker = _work()
+
+    def _db_divisions_on_result(self, df: pd.DataFrame) -> None:
+        """Handle result from load_divisions query."""
+        self._db_load_divisions_btn.setEnabled(True)
+
+        if df.empty:
+            self._db_status.setText("No division events found.")
+            return
+
+        coords = df[["t", "z", "y", "x"]].values
+        layer_name = "divisions"
+        if layer_name in self.viewer.layers:
+            layer = self.viewer.layers[layer_name]
+            layer.data = coords
+        else:
+            self.viewer.add_points(
+                coords,
+                face_color="magenta",
+                name=layer_name,
+                size=7,
+                opacity=0.9,
+            )
+
+        self._db_status.setText(f"Loaded {len(df)} division events")
+
+    def _db_divisions_on_error(self, exc: Exception) -> None:
+        """Handle error from load_divisions query."""
+        self._db_load_divisions_btn.setEnabled(True)
+        self._db_status.setText(f"Error loading divisions: {exc}")
+
+    def _db_on_colour_by_changed(self, column: str) -> None:
+        """Re-color candidates layer by a different scalar column."""
+        if self._db_candidates_df is None or column not in self._db_candidates_df.columns:
+            return
+
+        layer_name = "candidates"
+        if layer_name not in self.viewer.layers:
+            return
+
+        layer = self.viewer.layers[layer_name]
+        values = self._db_candidates_df[column].values
+
+        # Normalize to 0-1 for colormap
+        if values.size > 0:
+            v_min, v_max = values.min(), values.max()
+            if v_max > v_min:
+                normalized = (values - v_min) / (v_max - v_min)
+            else:
+                normalized = np.ones_like(values) * 0.5
+        else:
+            normalized = np.array([])
+
+        layer.face_color = normalized
+        layer.colormap = "viridis"
+        self._db_status.setText(f"Colored by {column}")
 
     # ══════════════════════════════════════════════════════════════════════
     # Run All

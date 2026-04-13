@@ -282,14 +282,22 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="s03 — run Ultrack tracking pipeline from the command line",
     )
-    parser.add_argument("--foreground", required=True, help="Path to foreground.tif stack")
-    parser.add_argument("--contours", required=True, help="Path to contours.tif stack")
+    parser.add_argument("--stage", default="all",
+                        choices=["all", "segmentation", "linking", "solve"],
+                        help="Which stage to run (default: all)")
+    parser.add_argument("--foreground", default=None, help="Path to foreground.tif stack")
+    parser.add_argument("--contours", default=None, help="Path to contours.tif stack")
     parser.add_argument("--working-dir", required=True, help="Ultrack working/output directory")
     parser.add_argument("--config", default=None, help="Path to JSON file with TrackingConfig fields")
     parser.add_argument("--overwrite-segmentation", action="store_true", default=True)
     parser.add_argument("--overwrite-linking", action="store_true", default=True)
     parser.add_argument("--overwrite-solve", action="store_true", default=True)
     args = parser.parse_args()
+
+    # Validate required args for each stage
+    if args.stage in ("all", "segmentation"):
+        if not args.foreground or not args.contours:
+            parser.error("--foreground and --contours are required for --stage all/segmentation")
 
     cfg_dict: dict = {}
     if args.config:
@@ -299,7 +307,18 @@ if __name__ == "__main__":
     cfg_dict.setdefault("overwrite_solve", args.overwrite_solve)
     cfg = TrackingConfig(**cfg_dict)
 
-    for step, total, label in run(args.foreground, args.contours, args.working_dir, cfg):
+    if args.stage == "all":
+        gen = run(args.foreground, args.contours, args.working_dir, cfg)
+    elif args.stage == "segmentation":
+        gen = run_segmentation(args.foreground, args.contours, args.working_dir, cfg, overwrite=cfg.overwrite_segmentation)
+    elif args.stage == "linking":
+        gen = run_linking(args.working_dir, cfg, overwrite=cfg.overwrite_linking)
+    elif args.stage == "solve":
+        gen = run_solve(args.working_dir, cfg, overwrite=cfg.overwrite_solve)
+    else:
+        parser.error(f"Unknown stage: {args.stage}")
+
+    for step, total, label in gen:
         print(f"[{step}/{total}] {label}", flush=True)
 
     sys.exit(0)
