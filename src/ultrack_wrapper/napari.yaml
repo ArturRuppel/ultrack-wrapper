@@ -1,0 +1,10 @@
+name: ultrack-wrapper
+display_name: Ultrack Wrapper
+contributions:
+  widgets:
+    - command: ultrack-wrapper.widget
+      display_name: Ultrack Wrapper
+  commands:
+    - id: ultrack-wrapper.widget
+      python_name: ultrack_wrapper.widget:UltrackWidget
+      title: Ultrack Wrapper

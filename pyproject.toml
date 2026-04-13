@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ultrack-wrapper"
+version = "0.1.0"
+description = "Napari plugin for 3D nucleus segmentation and tracking using Cellpose and Ultrack"
+requires-python = ">=3.9"
+dependencies = [
+    "napari",
+    "magicgui",
+    "cellpose",
+    "ultrack",
+    "tifffile",
+    "numpy",
+    "scipy",
+    "scikit-image",
+    "pydantic>=2",
+]
+
+[project.entry-points."napari.manifest"]
+ultrack-wrapper = "ultrack_wrapper:napari.yaml"
+
+[tool.setuptools.packages.find]
+where = ["src"]
