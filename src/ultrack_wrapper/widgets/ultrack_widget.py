@@ -989,12 +989,21 @@ class UltrackAnalysisWidget(QWidget):
         db_lay.addLayout(row)
 
         row = QHBoxLayout()
-        row.addWidget(QLabel("Colour candidates by:"))
-        self._db_colour_by_combo = QComboBox()
-        self._db_colour_by_combo.addItems(["selected", "area", "node_prob", "frontier", "height"])
-        self._db_colour_by_combo.setEnabled(False)
-        self._db_colour_by_combo.currentTextChanged.connect(self._db_on_colour_by_changed)
-        row.addWidget(self._db_colour_by_combo)
+        row.addWidget(QLabel("Size candidates by:"))
+        self._db_size_by_combo = QComboBox()
+        self._db_size_by_combo.addItems(["none", "area", "node_prob", "frontier", "height"])
+        self._db_size_by_combo.setEnabled(False)
+        self._db_size_by_combo.currentTextChanged.connect(self._db_on_size_by_changed)
+        row.addWidget(self._db_size_by_combo)
+
+        row.addWidget(QLabel("Scale:"))
+        self._db_size_scale = QDoubleSpinBox()
+        self._db_size_scale.setRange(1.0, 100.0)
+        self._db_size_scale.setValue(5.0)
+        self._db_size_scale.setSingleStep(1.0)
+        self._db_size_scale.setEnabled(False)
+        self._db_size_scale.valueChanged.connect(self._db_on_size_scale_changed)
+        row.addWidget(self._db_size_scale)
         row.addStretch()
         db_lay.addLayout(row)
 
@@ -1483,8 +1492,10 @@ class UltrackAnalysisWidget(QWidget):
             self._db_status.setText("No candidates found.")
             return
 
-        # Create or update Points layer
-        coords = df[["t", "z", "y", "x"]].values
+        # Create or update Points layer, projected to z=0
+        coords = df[["t", "z", "y", "x"]].values.copy()
+        coords[:, 1] = 0  # project to z=0
+
         # Color by selected status: green for selected, red for rejected (RGBA)
         selected = df["selected"].values.astype(bool)
         face_color = np.where(
@@ -1493,22 +1504,30 @@ class UltrackAnalysisWidget(QWidget):
             [0.9, 0.2, 0.2, 1.0],  # red
         )
 
+        # Compute per-point sizes
+        sizes = self._db_compute_sizes()
+
         layer_name = "candidates"
         if layer_name in self.viewer.layers:
             layer = self.viewer.layers[layer_name]
             layer.data = coords
             layer.face_color = face_color
+            layer.size = sizes
         else:
             self.viewer.add_points(
                 coords,
                 face_color=face_color,
                 name=layer_name,
-                size=5,
+                size=sizes,
                 opacity=0.8,
             )
 
-        self._db_colour_by_combo.setEnabled(True)
-        self._db_status.setText(f"Loaded {len(df)} candidates (green=selected, red=rejected)")
+        self._db_size_by_combo.setEnabled(True)
+        self._db_size_scale.setEnabled(True)
+        self._db_status.setText(
+            f"Loaded {len(df)} candidates (green=selected, red=rejected). "
+            f"Z-projected. Selected: {selected.sum()}, Rejected: {(~selected).sum()}"
+        )
 
     def _db_candidates_on_error(self, exc: Exception) -> None:
         """Handle error from load_candidates query."""
@@ -1561,8 +1580,11 @@ class UltrackAnalysisWidget(QWidget):
         # Create vectors in napari format: (N, 2, D) where D is spatial dims
         # First row: start position [z, y, x]
         # Second row: direction [dz, dy, dx]
-        starts = df[["z", "y", "x"]].values  # (N, 3)
-        directions = df[["dz", "dy", "dx"]].values  # (N, 3)
+        # Project to z=0 by zeroing z component and z-direction
+        starts = df[["z", "y", "x"]].values.copy()  # (N, 3)
+        starts[:, 0] = 0  # project start z to 0
+        directions = df[["dz", "dy", "dx"]].values.copy()  # (N, 3)
+        directions[:, 0] = 0  # zero out z-direction (project to 2D)
         vectors = np.stack([starts, directions], axis=1)  # (N, 2, 3)
 
         # Normalize weight to 0-1 for colormap
@@ -1594,7 +1616,7 @@ class UltrackAnalysisWidget(QWidget):
                 opacity=0.7,
             )
 
-        self._db_status.setText(f"Loaded {len(df)} candidate links (colored by weight)")
+        self._db_status.setText(f"Loaded {len(df)} candidate links (z-projected, colored by weight)")
 
     def _db_links_on_error(self, exc: Exception) -> None:
         """Handle error from load_links query."""
@@ -1647,7 +1669,8 @@ class UltrackAnalysisWidget(QWidget):
             self._db_status.setText("No division events found.")
             return
 
-        coords = df[["t", "z", "y", "x"]].values
+        coords = df[["t", "z", "y", "x"]].values.copy()
+        coords[:, 1] = 0  # project to z=0
         layer_name = "divisions"
         if layer_name in self.viewer.layers:
             layer = self.viewer.layers[layer_name]
@@ -1661,16 +1684,38 @@ class UltrackAnalysisWidget(QWidget):
                 opacity=0.9,
             )
 
-        self._db_status.setText(f"Loaded {len(df)} division events")
+        self._db_status.setText(f"Loaded {len(df)} division events (z-projected)")
 
     def _db_divisions_on_error(self, exc: Exception) -> None:
         """Handle error from load_divisions query."""
         self._db_load_divisions_btn.setEnabled(True)
         self._db_status.setText(f"Error loading divisions: {exc}")
 
-    def _db_on_colour_by_changed(self, column: str) -> None:
-        """Re-color candidates layer by a different scalar column."""
-        if self._db_candidates_df is None or column not in self._db_candidates_df.columns:
+    def _db_compute_sizes(self) -> np.ndarray:
+        """Compute per-point sizes based on current size_by column and scale."""
+        if self._db_candidates_df is None:
+            return np.array([])
+
+        scale = self._db_size_scale.value()
+        column = self._db_size_by_combo.currentText()
+        n = len(self._db_candidates_df)
+
+        if column == "none" or column not in self._db_candidates_df.columns:
+            return np.full(n, scale)
+
+        values = self._db_candidates_df[column].values.astype(float)
+        v_min, v_max = np.nanmin(values), np.nanmax(values)
+        if v_max > v_min:
+            normalized = (values - v_min) / (v_max - v_min)
+        else:
+            normalized = np.ones(n) * 0.5
+
+        # Scale from 20% to 100% of scale value
+        return scale * (0.2 + 0.8 * normalized)
+
+    def _db_on_size_by_changed(self, column: str) -> None:
+        """Re-size candidates layer by a scalar column."""
+        if self._db_candidates_df is None:
             return
 
         layer_name = "candidates"
@@ -1678,28 +1723,20 @@ class UltrackAnalysisWidget(QWidget):
             return
 
         layer = self.viewer.layers[layer_name]
+        layer.size = self._db_compute_sizes()
+        self._db_status.setText(f"Sized candidates by {column}")
 
-        if column == "selected":
-            # Binary color: green for True, red for False
-            selected = self._db_candidates_df["selected"].values.astype(bool)
-            face_color = np.where(
-                selected[:, None],
-                [0.2, 0.9, 0.2, 1.0],  # green
-                [0.9, 0.2, 0.2, 1.0],  # red
-            )
-        else:
-            # Continuous column: normalize and apply viridis colormap
-            values = self._db_candidates_df[column].values.astype(float)
-            v_min, v_max = np.nanmin(values), np.nanmax(values)
-            if v_max > v_min:
-                normalized = (values - v_min) / (v_max - v_min)
-            else:
-                normalized = np.ones_like(values) * 0.5
-            cmap = get_cmap("viridis")
-            face_color = cmap(normalized)
+    def _db_on_size_scale_changed(self, value: float) -> None:
+        """Update overall point size scale."""
+        if self._db_candidates_df is None:
+            return
 
-        layer.face_color = face_color
-        self._db_status.setText(f"Colored candidates by {column}")
+        layer_name = "candidates"
+        if layer_name not in self.viewer.layers:
+            return
+
+        layer = self.viewer.layers[layer_name]
+        layer.size = self._db_compute_sizes()
 
     def _db_on_load_labels(self) -> None:
         """Load tracked segmentation labels (tracked_labels.tif) as a Labels layer."""
@@ -1898,6 +1935,8 @@ class UltrackAnalysisWidget(QWidget):
         if not path:
             return
         data = {
+            "input_path": self._input_edit.text(),
+            "output_path": self._output_edit.text(),
             "cp_contours": self._cp_ct_build_config().model_dump(),
             "tracking": self._tr_build_config().model_dump(),
         }
@@ -1910,6 +1949,10 @@ class UltrackAnalysisWidget(QWidget):
         if not path:
             return
         data = json.loads(Path(path).read_text())
+        if "input_path" in data:
+            self._input_edit.setText(data["input_path"])
+        if "output_path" in data:
+            self._output_edit.setText(data["output_path"])
         if "cp_contours" in data:
             self._cp_ct_apply_config(CellposeContoursConfig(**data["cp_contours"]))
         if "tracking" in data:
