@@ -80,8 +80,6 @@ class UltrackAnalysisWidget(QWidget):
         # Cached preview data
         self._cp_ct_dp: np.ndarray | None = None
         self._cp_ct_prob: np.ndarray | None = None
-        self._cp_ct_dp_stack: np.ndarray | None = None
-        self._cp_ct_prob_stack: np.ndarray | None = None
 
         # Napari layer handles (preview)
         self._cp_ct_labels_layer = None
@@ -198,26 +196,14 @@ class UltrackAnalysisWidget(QWidget):
         grp = QGroupBox("Contours (Cellpose)")
         lay = QVBoxLayout()
 
-        # Preview timepoint range
+        # Preview timepoint
         row = QHBoxLayout()
-        row.addWidget(QLabel("Preview timepoint range"))
-        self._cp_ct_tp_start = QSpinBox()
-        self._cp_ct_tp_start.setRange(0, 9999)
-        self._cp_ct_tp_start.setValue(0)
-        self._cp_ct_tp_start.setToolTip("Start timepoint index")
-        row.addWidget(self._cp_ct_tp_start)
-        row.addWidget(QLabel("to"))
-        self._cp_ct_tp_end = QSpinBox()
-        self._cp_ct_tp_end.setRange(0, 9999)
-        self._cp_ct_tp_end.setValue(0)
-        self._cp_ct_tp_end.setToolTip("End timepoint index (inclusive)")
-        row.addWidget(self._cp_ct_tp_end)
-        row.addWidget(QLabel("step"))
-        self._cp_ct_tp_step = QSpinBox()
-        self._cp_ct_tp_step.setRange(1, 9999)
-        self._cp_ct_tp_step.setValue(1)
-        self._cp_ct_tp_step.setToolTip("Step size for timepoint range")
-        row.addWidget(self._cp_ct_tp_step)
+        row.addWidget(QLabel("Preview timepoint"))
+        self._cp_ct_tp_idx = QSpinBox()
+        self._cp_ct_tp_idx.setRange(0, 9999)
+        self._cp_ct_tp_idx.setValue(0)
+        self._cp_ct_tp_idx.setToolTip("Index of the timepoint to use for live preview")
+        row.addWidget(self._cp_ct_tp_idx)
         lay.addLayout(row)
 
         # Flow threshold
@@ -232,19 +218,42 @@ class UltrackAnalysisWidget(QWidget):
         self._cp_ct_flow_thresh.setToolTip(
             "Cellpose flow consistency threshold. Lower = more strict (fewer cells). Default: 0.4"
         )
+        self._cp_ct_flow_thresh.valueChanged.connect(self._cp_ct_schedule)
         row.addWidget(self._cp_ct_flow_thresh)
         lay.addLayout(row)
 
-        # Cell probability threshold(s)
+        # Cell probability threshold sweep range
         row = QHBoxLayout()
-        row.addWidget(QLabel("Cellprob threshold(s)"))
-        self._cp_ct_cellprob_thresh = QLineEdit()
-        self._cp_ct_cellprob_thresh.setText("0.0")
-        self._cp_ct_cellprob_thresh.setToolTip(
-            "Comma-separated cellprob thresholds to average together. "
-            "E.g., '-5, -2.5, 0, 2.5, 5' or '0.0' for single value"
-        )
-        row.addWidget(self._cp_ct_cellprob_thresh)
+        row.addWidget(QLabel("Cellprob threshold sweep"))
+        self._cp_ct_cellprob_min = QDoubleSpinBox()
+        self._cp_ct_cellprob_min.setMinimum(-999999.0)
+        self._cp_ct_cellprob_min.setMaximum(999999.0)
+        self._cp_ct_cellprob_min.setSingleStep(0.5)
+        self._cp_ct_cellprob_min.setDecimals(1)
+        self._cp_ct_cellprob_min.setValue(0.0)
+        self._cp_ct_cellprob_min.setToolTip("Minimum cellprob threshold")
+        self._cp_ct_cellprob_min.valueChanged.connect(self._cp_ct_schedule)
+        row.addWidget(self._cp_ct_cellprob_min)
+        row.addWidget(QLabel("to"))
+        self._cp_ct_cellprob_max = QDoubleSpinBox()
+        self._cp_ct_cellprob_max.setMinimum(-999999.0)
+        self._cp_ct_cellprob_max.setMaximum(999999.0)
+        self._cp_ct_cellprob_max.setSingleStep(0.5)
+        self._cp_ct_cellprob_max.setDecimals(1)
+        self._cp_ct_cellprob_max.setValue(0.0)
+        self._cp_ct_cellprob_max.setToolTip("Maximum cellprob threshold")
+        self._cp_ct_cellprob_max.valueChanged.connect(self._cp_ct_schedule)
+        row.addWidget(self._cp_ct_cellprob_max)
+        row.addWidget(QLabel("step"))
+        self._cp_ct_cellprob_step = QDoubleSpinBox()
+        self._cp_ct_cellprob_step.setMinimum(0.01)
+        self._cp_ct_cellprob_step.setMaximum(999999.0)
+        self._cp_ct_cellprob_step.setSingleStep(0.5)
+        self._cp_ct_cellprob_step.setDecimals(2)
+        self._cp_ct_cellprob_step.setValue(1.0)
+        self._cp_ct_cellprob_step.setToolTip("Step size for cellprob threshold sweep")
+        self._cp_ct_cellprob_step.valueChanged.connect(self._cp_ct_schedule)
+        row.addWidget(self._cp_ct_cellprob_step)
         lay.addLayout(row)
 
         # 3D mode checkbox
@@ -316,16 +325,10 @@ class UltrackAnalysisWidget(QWidget):
 
     def _cp_ct_build_config(self) -> CellposeContoursConfig:
         """Build config from current UI state."""
-        # Use first threshold for single-run config, or 0.0 if list is empty
-        thresh_str = self._cp_ct_cellprob_thresh.text().strip()
-        try:
-            thresholds = [float(x.strip()) for x in thresh_str.split(',') if x.strip()]
-            cellprob_threshold = thresholds[0] if thresholds else 0.0
-        except ValueError:
-            cellprob_threshold = 0.0
+        # Use min threshold for single-run config
+        cellprob_threshold = self._cp_ct_cellprob_min.value()
 
         return CellposeContoursConfig(
-            flow_threshold=self._cp_ct_flow_thresh.value(),
             cellprob_threshold=cellprob_threshold,
             do_3D=self._cp_ct_3d_chk.isChecked(),
             smooth_sigma=self._cp_ct_smooth_sigma.value(),
@@ -334,8 +337,7 @@ class UltrackAnalysisWidget(QWidget):
 
     def _cp_ct_apply_config(self, cfg: CellposeContoursConfig) -> None:
         """Apply config to UI."""
-        self._cp_ct_flow_thresh.setValue(cfg.flow_threshold)
-        self._cp_ct_cellprob_thresh.setText(str(cfg.cellprob_threshold))
+        self._cp_ct_cellprob_min.setValue(cfg.cellprob_threshold)
         self._cp_ct_3d_chk.setChecked(cfg.do_3D)
         self._cp_ct_smooth_sigma.setValue(cfg.smooth_sigma)
         self._cp_ct_device.setCurrentText(cfg.device)
@@ -346,7 +348,7 @@ class UltrackAnalysisWidget(QWidget):
             self._cp_ct_timer.start()
 
     def _cp_ct_on_preview(self) -> None:
-        """Load dP and prob maps for a range of timepoints."""
+        """Load dP and prob maps for a single timepoint."""
         paths = self._get_paths()
         if paths is None:
             self._cp_ct_status.setText("Set input and output directories first.")
@@ -355,9 +357,7 @@ class UltrackAnalysisWidget(QWidget):
 
         dp_files = discover_dp_files(inp)
         prob_files = discover_prob_files(inp)
-        start = self._cp_ct_tp_start.value()
-        end = self._cp_ct_tp_end.value()
-        step = self._cp_ct_tp_step.value()
+        tp_idx = self._cp_ct_tp_idx.value()
 
         if not dp_files or not prob_files:
             self._cp_ct_status.setText("No t*_dp.tif or t*_prob.tif files found.")
@@ -367,109 +367,69 @@ class UltrackAnalysisWidget(QWidget):
             self._cp_ct_status.setText(f"Mismatch: {len(dp_files)} dp vs {len(prob_files)} prob files.")
             return
 
-        if end >= len(dp_files):
+        if tp_idx >= len(dp_files):
             self._cp_ct_status.setText(f"Only {len(dp_files)} timepoints available.")
             return
 
-        # Load all timepoints in range
-        indices = range(start, end + 1, step)
-        self._cp_ct_status.setText(f"Loading {len(indices)} timepoint(s)\u2026")
-
-        dp_list = []
-        prob_list = []
-        for idx in indices:
-            dp = tifffile.imread(str(dp_files[idx])).astype(np.float32)
-            prob = tifffile.imread(str(prob_files[idx])).astype(np.float32)
-            dp_list.append(dp)
-            prob_list.append(prob)
-
-        # Store as stacks for preview
-        self._cp_ct_dp_stack = np.stack(dp_list, axis=0)
-        self._cp_ct_prob_stack = np.stack(prob_list, axis=0)
+        # Load single timepoint
+        self._cp_ct_status.setText(f"Loading {dp_files[tp_idx].name}\u2026")
+        self._cp_ct_dp = tifffile.imread(str(dp_files[tp_idx])).astype(np.float32)
+        self._cp_ct_prob = tifffile.imread(str(prob_files[tp_idx])).astype(np.float32)
         self._cp_ct_update_preview()
-        self._cp_ct_status.setText(f"Preview: timepoints {start}-{end} step {step}")
+        self._cp_ct_status.setText(f"Preview: {dp_files[tp_idx].name}")
 
     def _cp_ct_update_preview(self) -> None:
         """Update preview with current configuration, averaging multiple cellprob thresholds."""
-        # Check if we have stack data or single frame
-        if hasattr(self, '_cp_ct_dp_stack') and self._cp_ct_dp_stack is not None:
-            dp_data = self._cp_ct_dp_stack
-            prob_data = self._cp_ct_prob_stack
-            is_stack = dp_data.ndim == 3  # (T, H, W)
-        elif hasattr(self, '_cp_ct_dp') and self._cp_ct_dp is not None:
-            dp_data = self._cp_ct_dp
-            prob_data = self._cp_ct_prob
-            is_stack = False
-        else:
+        # Check if we have data
+        if not (hasattr(self, '_cp_ct_dp') and self._cp_ct_dp is not None):
+            return
+        if not (hasattr(self, '_cp_ct_prob') and self._cp_ct_prob is not None):
             return
 
-        # Parse comma-separated cellprob thresholds
-        thresh_str = self._cp_ct_cellprob_thresh.text().strip()
-        try:
-            thresholds = [float(x.strip()) for x in thresh_str.split(',') if x.strip()]
-        except ValueError:
-            self._cp_ct_status.setText("Error: Invalid cellprob threshold values (use comma-separated floats)")
+        dp_data = self._cp_ct_dp
+        prob_data = self._cp_ct_prob
+
+        # Generate cellprob thresholds from min/max/step
+        min_thresh = self._cp_ct_cellprob_min.value()
+        max_thresh = self._cp_ct_cellprob_max.value()
+        step = self._cp_ct_cellprob_step.value()
+
+        if step <= 0:
+            self._cp_ct_status.setText("Error: step size must be positive")
             return
+
+        # Generate thresholds
+        if min_thresh == max_thresh:
+            thresholds = [min_thresh]
+        else:
+            # Create range with numpy arange to avoid floating-point precision issues
+            thresholds = list(np.arange(min_thresh, max_thresh + step / 2, step))
 
         if not thresholds:
-            self._cp_ct_status.setText("Error: No cellprob thresholds specified")
+            self._cp_ct_status.setText("Error: no cellprob thresholds generated")
             return
 
         cfg = self._cp_ct_build_config()
 
-        # Process single frame or stack
-        if is_stack:
-            num_frames = dp_data.shape[0]
-            all_labels = []
-            all_fg = []
-            all_contours = []
+        # Single frame processing
+        contours_list = []
+        labels_list = []
+        fg_list = []
 
-            for frame_idx in range(num_frames):
-                frame_labels_list = []
-                frame_fg_list = []
-                frame_contours_list = []
+        for thresh in thresholds:
+            cfg.cellprob_threshold = thresh
+            try:
+                labels, fg, contours = compute_cp_contours_single(dp_data, prob_data, cfg)
+                labels_list.append(labels)
+                fg_list.append(fg)
+                contours_list.append(contours)
+            except Exception as e:
+                self._cp_ct_status.setText(f"Error computing threshold {thresh}: {e}")
+                return
 
-                for thresh in thresholds:
-                    cfg.cellprob_threshold = thresh
-                    try:
-                        labels, fg, contours = compute_cp_contours_single(
-                            dp_data[frame_idx], prob_data[frame_idx], cfg
-                        )
-                        frame_labels_list.append(labels)
-                        frame_fg_list.append(fg)
-                        frame_contours_list.append(contours)
-                    except Exception as e:
-                        self._cp_ct_status.setText(f"Error frame {frame_idx} threshold {thresh}: {e}")
-                        return
-
-                # Average thresholds for this frame
-                all_labels.append(frame_labels_list[0])
-                all_fg.append(np.mean(frame_fg_list, axis=0))
-                all_contours.append(np.mean(frame_contours_list, axis=0))
-
-            labels_stack = np.stack(all_labels, axis=0)
-            fg_stack = np.stack(all_fg, axis=0)
-            contours_stack = np.stack(all_contours, axis=0)
-        else:
-            # Single frame
-            contours_list = []
-            labels_list = []
-            fg_list = []
-
-            for thresh in thresholds:
-                cfg.cellprob_threshold = thresh
-                try:
-                    labels, fg, contours = compute_cp_contours_single(dp_data, prob_data, cfg)
-                    labels_list.append(labels)
-                    fg_list.append(fg)
-                    contours_list.append(contours)
-                except Exception as e:
-                    self._cp_ct_status.setText(f"Error computing threshold {thresh}: {e}")
-                    return
-
-            labels_stack = labels_list[0]
-            fg_stack = np.mean(fg_list, axis=0)
-            contours_stack = np.mean(contours_list, axis=0)
+        labels_stack = labels_list[0]
+        fg_stack = np.mean(fg_list, axis=0)
+        contours_stack = np.mean(contours_list, axis=0)
 
         # Update or create labels layer
         if self._cp_ct_labels_layer is None or self._cp_ct_labels_layer not in self.viewer.layers:
