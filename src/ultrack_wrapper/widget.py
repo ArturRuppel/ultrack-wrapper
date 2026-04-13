@@ -5,6 +5,7 @@ from __future__ import annotations
 from qtpy.QtWidgets import QTabWidget, QWidget, QVBoxLayout, QLabel
 
 from ultrack_wrapper._widget_data_prep import DataPrepWidget
+from ultrack_wrapper._widget_foreground import ForegroundWidget
 
 
 class UltrackWidget(QTabWidget):
@@ -16,7 +17,7 @@ class UltrackWidget(QTabWidget):
 
         self.addTab(DataPrepWidget(napari_viewer), "Data Prep")
         self.addTab(self._make_placeholder("Cellpose"), "Cellpose")
-        self.addTab(self._make_placeholder("Foreground"), "Foreground")
+        self.addTab(ForegroundWidget(napari_viewer), "Foreground")
         self.addTab(self._make_placeholder("Tracking"), "Tracking")
         self.addTab(self._make_placeholder("Post-processing"), "Post-proc")
 

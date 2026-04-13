@@ -30,8 +30,28 @@ class CellposeConfig(BaseModel):
 class ForegroundConfig(BaseModel):
     """Parameters for foreground detection (s02)."""
 
-    method: str = "fixed"  # "fixed", "otsu", or "triangle"
+    median_filter: bool = False
+    median_radius: int = 2
+    gaussian_filter: bool = False
+    gaussian_sigma: float = 1.0
+    clahe: bool = False
+    clahe_clip_limit: float = 0.01
+    clahe_kernel_size: int = 0  # 0 = auto (1/8 of image size)
+    method: str = "fixed"  # "fixed", "otsu", "triangle", or "sigmoid"
     threshold: float = 1.0
+    sigmoid_center: float = 1.0
+    sigmoid_steepness: float = 3.0
+    fill_holes: bool = True
+    fill_holes_max_size: int = 0  # 0 = fill all holes
+    morpho_op: str = "none"  # "none", "opening", "closing"
+    morpho_radius: int = 2
+    remove_small: bool = True
+    remove_small_min_size: int = 500
+    area_filter: bool = False
+    area_filter_min: int = 100
+    area_filter_max: int = 100000
+    distance_filter: bool = False
+    distance_filter_min_radius: float = 3.0
 
 
 class TrackingConfig(BaseModel):
