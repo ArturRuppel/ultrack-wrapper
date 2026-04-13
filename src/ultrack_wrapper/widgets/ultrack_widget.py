@@ -218,7 +218,6 @@ class UltrackAnalysisWidget(QWidget):
         self._cp_ct_flow_thresh.setToolTip(
             "Cellpose flow consistency threshold. Lower = more strict (fewer cells). Default: 0.4"
         )
-        self._cp_ct_flow_thresh.valueChanged.connect(self._cp_ct_schedule)
         row.addWidget(self._cp_ct_flow_thresh)
         lay.addLayout(row)
 
@@ -232,7 +231,6 @@ class UltrackAnalysisWidget(QWidget):
         self._cp_ct_cellprob_min.setDecimals(1)
         self._cp_ct_cellprob_min.setValue(0.0)
         self._cp_ct_cellprob_min.setToolTip("Minimum cellprob threshold")
-        self._cp_ct_cellprob_min.valueChanged.connect(self._cp_ct_schedule)
         row.addWidget(self._cp_ct_cellprob_min)
         row.addWidget(QLabel("to"))
         self._cp_ct_cellprob_max = QDoubleSpinBox()
@@ -242,7 +240,6 @@ class UltrackAnalysisWidget(QWidget):
         self._cp_ct_cellprob_max.setDecimals(1)
         self._cp_ct_cellprob_max.setValue(0.0)
         self._cp_ct_cellprob_max.setToolTip("Maximum cellprob threshold")
-        self._cp_ct_cellprob_max.valueChanged.connect(self._cp_ct_schedule)
         row.addWidget(self._cp_ct_cellprob_max)
         row.addWidget(QLabel("step"))
         self._cp_ct_cellprob_step = QDoubleSpinBox()
@@ -252,7 +249,6 @@ class UltrackAnalysisWidget(QWidget):
         self._cp_ct_cellprob_step.setDecimals(2)
         self._cp_ct_cellprob_step.setValue(1.0)
         self._cp_ct_cellprob_step.setToolTip("Step size for cellprob threshold sweep")
-        self._cp_ct_cellprob_step.valueChanged.connect(self._cp_ct_schedule)
         row.addWidget(self._cp_ct_cellprob_step)
         lay.addLayout(row)
 
