@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import tifffile
+from matplotlib.cm import get_cmap
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtWidgets import (
     QCheckBox,
@@ -24,6 +25,7 @@ from qtpy.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -1240,6 +1242,12 @@ class UltrackAnalysisWidget(QWidget):
         self._db_load_divisions_btn = QPushButton("Load Divisions")
         self._db_load_divisions_btn.clicked.connect(self._db_on_load_divisions)
         row.addWidget(self._db_load_divisions_btn)
+        self._db_load_labels_btn = QPushButton("Load Labels")
+        self._db_load_labels_btn.clicked.connect(self._db_on_load_labels)
+        row.addWidget(self._db_load_labels_btn)
+        self._db_show_stats_btn = QPushButton("Show Stats")
+        self._db_show_stats_btn.clicked.connect(self._db_on_show_stats)
+        row.addWidget(self._db_show_stats_btn)
         db_lay.addLayout(row)
 
         row = QHBoxLayout()
@@ -1252,7 +1260,9 @@ class UltrackAnalysisWidget(QWidget):
         row.addStretch()
         db_lay.addLayout(row)
 
-        self._db_status = QLabel("")
+        self._db_status = QTextEdit()
+        self._db_status.setReadOnly(True)
+        self._db_status.setMaximumHeight(80)
         db_lay.addWidget(self._db_status)
 
         db_grp.setLayout(db_lay)
@@ -1737,8 +1747,13 @@ class UltrackAnalysisWidget(QWidget):
 
         # Create or update Points layer
         coords = df[["t", "z", "y", "x"]].values
-        # Color by selected status: True (green) = 1, False (red) = 0
-        face_color = df["selected"].astype(int).values
+        # Color by selected status: green for selected, red for rejected (RGBA)
+        selected = df["selected"].values.astype(bool)
+        face_color = np.where(
+            selected[:, None],
+            [0.2, 0.9, 0.2, 1.0],  # green
+            [0.9, 0.2, 0.2, 1.0],  # red
+        )
 
         layer_name = "candidates"
         if layer_name in self.viewer.layers:
@@ -1812,32 +1827,36 @@ class UltrackAnalysisWidget(QWidget):
         directions = df[["dz", "dy", "dx"]].values  # (N, 3)
         vectors = np.stack([starts, directions], axis=1)  # (N, 2, 3)
 
-        # Normalize edge width by weight (0 to 1)
+        # Normalize weight to 0-1 for colormap
         weights = df["weight"].values
         if weights.size > 0:
             w_min, w_max = weights.min(), weights.max()
             if w_max > w_min:
-                edge_width = (weights - w_min) / (w_max - w_min) * 10 + 0.5
+                w_norm = (weights - w_min) / (w_max - w_min)
             else:
-                edge_width = np.ones_like(weights) * 5
+                w_norm = np.ones_like(weights) * 0.5
         else:
-            edge_width = np.ones_like(weights)
+            w_norm = np.array([])
+
+        # Color by weight using plasma colormap (N, 4) RGBA
+        cmap = get_cmap("plasma")
+        edge_color = cmap(w_norm)
 
         layer_name = "candidate_links"
         if layer_name in self.viewer.layers:
             layer = self.viewer.layers[layer_name]
             layer.data = vectors
-            layer.edge_width = edge_width
+            layer.edge_color = edge_color
         else:
             self.viewer.add_vectors(
                 vectors,
-                edge_width=edge_width,
+                edge_color=edge_color,
+                edge_width=1,
                 name=layer_name,
-                edge_color="yellow",
                 opacity=0.7,
             )
 
-        self._db_status.setText(f"Loaded {len(df)} candidate links")
+        self._db_status.setText(f"Loaded {len(df)} candidate links (colored by weight)")
 
     def _db_links_on_error(self, exc: Exception) -> None:
         """Handle error from load_links query."""
@@ -1921,21 +1940,119 @@ class UltrackAnalysisWidget(QWidget):
             return
 
         layer = self.viewer.layers[layer_name]
-        values = self._db_candidates_df[column].values
 
-        # Normalize to 0-1 for colormap
-        if values.size > 0:
-            v_min, v_max = values.min(), values.max()
+        if column == "selected":
+            # Binary color: green for True, red for False
+            selected = self._db_candidates_df["selected"].values.astype(bool)
+            face_color = np.where(
+                selected[:, None],
+                [0.2, 0.9, 0.2, 1.0],  # green
+                [0.9, 0.2, 0.2, 1.0],  # red
+            )
+        else:
+            # Continuous column: normalize and apply viridis colormap
+            values = self._db_candidates_df[column].values.astype(float)
+            v_min, v_max = np.nanmin(values), np.nanmax(values)
             if v_max > v_min:
                 normalized = (values - v_min) / (v_max - v_min)
             else:
                 normalized = np.ones_like(values) * 0.5
-        else:
-            normalized = np.array([])
+            cmap = get_cmap("viridis")
+            face_color = cmap(normalized)
 
-        layer.face_color = normalized
-        layer.colormap = "viridis"
-        self._db_status.setText(f"Colored by {column}")
+        layer.face_color = face_color
+        self._db_status.setText(f"Colored candidates by {column}")
+
+    def _db_on_load_labels(self) -> None:
+        """Load tracked segmentation labels (tracked_labels.tif) as a Labels layer."""
+        paths = self._get_paths()
+        if paths is None:
+            self._db_status.setText("Set input and output directories first.")
+            return
+        _, out = paths
+        wd = Path(out)
+        labels_path = wd / "tracked_labels.tif"
+
+        if not labels_path.exists():
+            self._db_status.setText(f"Labels file not found: {labels_path}")
+            return
+
+        try:
+            labels = tifffile.imread(str(labels_path))
+            layer_name = "tracked_labels"
+            if layer_name in self.viewer.layers:
+                layer = self.viewer.layers[layer_name]
+                layer.data = labels
+            else:
+                self.viewer.add_labels(labels, name=layer_name)
+            self._db_status.setText(f"Loaded tracked_labels {labels.shape}")
+        except Exception as e:
+            self._db_status.setText(f"Error loading labels: {e}")
+
+    def _db_on_show_stats(self) -> None:
+        """Query database for summary statistics."""
+        paths = self._get_paths()
+        if paths is None:
+            self._db_status.setText("Set input and output directories first.")
+            return
+        _, out = paths
+        wd = Path(out)
+
+        self._db_show_stats_btn.setEnabled(False)
+        self._db_status.setText("Loading statistics…")
+
+        @thread_worker(connect={
+            "returned": self._db_stats_on_result,
+            "errored": self._db_stats_on_error,
+        })
+        def _work():
+            db_path = wd / "data.db"
+            if not db_path.exists():
+                raise FileNotFoundError(f"Database not found: {db_path}")
+            conn = sqlite3.connect(str(db_path))
+
+            # Query node statistics
+            node_query = """
+                SELECT
+                    COUNT(*) AS total_nodes,
+                    SUM(CASE WHEN selected=1 THEN 1 ELSE 0 END) AS selected_nodes,
+                    COUNT(DISTINCT t) AS num_timepoints,
+                    ROUND(MIN(area), 2) AS min_area,
+                    ROUND(MAX(area), 2) AS max_area,
+                    ROUND(AVG(area), 2) AS avg_area
+                FROM nodes
+            """
+            node_stats = pd.read_sql_query(node_query, conn).iloc[0]
+
+            # Query link statistics
+            link_query = "SELECT COUNT(*) AS total_links FROM links"
+            link_stats = pd.read_sql_query(link_query, conn).iloc[0]
+
+            conn.close()
+            return {"nodes": node_stats, "links": link_stats}
+
+        self._db_worker = _work()
+
+    def _db_stats_on_result(self, stats: dict) -> None:
+        """Handle result from show_stats query."""
+        self._db_show_stats_btn.setEnabled(True)
+        node_stats = stats["nodes"]
+        link_stats = stats["links"]
+
+        text = (
+            f"Nodes: {int(node_stats['total_nodes'])} total, "
+            f"{int(node_stats['selected_nodes'])} selected\n"
+            f"Timepoints: {int(node_stats['num_timepoints'])}\n"
+            f"Area: min={node_stats['min_area']}, max={node_stats['max_area']}, "
+            f"avg={node_stats['avg_area']}\n"
+            f"Links: {int(link_stats['total_links'])} total"
+        )
+        self._db_status.setText(text)
+
+    def _db_stats_on_error(self, exc: Exception) -> None:
+        """Handle error from show_stats query."""
+        self._db_show_stats_btn.setEnabled(True)
+        self._db_status.setText(f"Error loading statistics: {exc}")
 
     # ══════════════════════════════════════════════════════════════════════
     # Run All
