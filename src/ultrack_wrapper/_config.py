@@ -103,8 +103,10 @@ class TrackingConfig(BaseModel):
     time_limit: int = 36000
     window_size: int = 0  # 0 = solve all at once
 
-    # Overwrite mode
-    overwrite: str = "all"  # "all", "links", "solutions", "none"
+    # Per-stage overwrite flags (controls whether Run All re-runs each step)
+    overwrite_segmentation: bool = True
+    overwrite_linking: bool = True
+    overwrite_solve: bool = True
 
 
 class ProjectConfig(BaseModel):

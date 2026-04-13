@@ -47,6 +47,9 @@ from ultrack_wrapper.stages.s03_tracking import (
     get_labels_layer,
     get_tracks_layer,
     run as run_s03,
+    run_segmentation,
+    run_linking,
+    run_solve,
 )
 
 
@@ -72,6 +75,9 @@ class UltrackAnalysisWidget(QWidget):
         self._fg_worker = None
         self._ct_worker = None
         self._tr_worker = None
+        self._seg_worker = None
+        self._lnk_worker = None
+        self._slv_worker = None
         self._all_worker = None
 
         # Cached preview data
@@ -935,9 +941,16 @@ class UltrackAnalysisWidget(QWidget):
         grp = QGroupBox("Tracking")
         lay = QVBoxLayout()
 
-        # Segmentation
+        # ── SEGMENTATION sub-section ─────────────────────────────────────
         seg = QGroupBox("Segmentation hypotheses")
         sl = QVBoxLayout()
+
+        # Overwrite checkbox for segmentation
+        row = QHBoxLayout()
+        self._tr_overwrite_seg_chk = QCheckBox("Overwrite")
+        self._tr_overwrite_seg_chk.setChecked(True)
+        row.addWidget(self._tr_overwrite_seg_chk)
+        sl.addLayout(row)
 
         row = QHBoxLayout()
         row.addWidget(QLabel("Min area"))
@@ -981,12 +994,45 @@ class UltrackAnalysisWidget(QWidget):
         row.addWidget(self._tr_aniso)
         sl.addLayout(row)
 
+        # Workers for segmentation
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Workers"))
+        self._tr_seg_workers = QSpinBox()
+        self._tr_seg_workers.setRange(1, 64)
+        self._tr_seg_workers.setValue(1)
+        row.addWidget(self._tr_seg_workers)
+        sl.addLayout(row)
+
+        # Buttons for segmentation
+        row = QHBoxLayout()
+        self._tr_seg_run_btn = QPushButton("Run Segmentation")
+        self._tr_seg_run_btn.clicked.connect(self._tr_on_run_segmentation)
+        row.addWidget(self._tr_seg_run_btn)
+        self._tr_seg_cancel_btn = QPushButton("Cancel")
+        self._tr_seg_cancel_btn.setEnabled(False)
+        self._tr_seg_cancel_btn.clicked.connect(self._tr_on_seg_cancel)
+        row.addWidget(self._tr_seg_cancel_btn)
+        sl.addLayout(row)
+
+        self._tr_seg_progress = QProgressBar()
+        self._tr_seg_progress.setVisible(False)
+        sl.addWidget(self._tr_seg_progress)
+        self._tr_seg_status = QLabel("")
+        sl.addWidget(self._tr_seg_status)
+
         seg.setLayout(sl)
         lay.addWidget(seg)
 
-        # Linking
+        # ── LINKING sub-section ──────────────────────────────────────────
         lnk = QGroupBox("Linking")
         ll = QVBoxLayout()
+
+        # Overwrite checkbox for linking
+        row = QHBoxLayout()
+        self._tr_overwrite_lnk_chk = QCheckBox("Overwrite")
+        self._tr_overwrite_lnk_chk.setChecked(True)
+        row.addWidget(self._tr_overwrite_lnk_chk)
+        ll.addLayout(row)
 
         row = QHBoxLayout()
         row.addWidget(QLabel("Max distance"))
@@ -1012,12 +1058,45 @@ class UltrackAnalysisWidget(QWidget):
         row.addWidget(self._tr_dist_w)
         ll.addLayout(row)
 
+        # Workers for linking
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Workers"))
+        self._tr_lnk_workers = QSpinBox()
+        self._tr_lnk_workers.setRange(1, 64)
+        self._tr_lnk_workers.setValue(1)
+        row.addWidget(self._tr_lnk_workers)
+        ll.addLayout(row)
+
+        # Buttons for linking
+        row = QHBoxLayout()
+        self._tr_lnk_run_btn = QPushButton("Run Linking")
+        self._tr_lnk_run_btn.clicked.connect(self._tr_on_run_linking)
+        row.addWidget(self._tr_lnk_run_btn)
+        self._tr_lnk_cancel_btn = QPushButton("Cancel")
+        self._tr_lnk_cancel_btn.setEnabled(False)
+        self._tr_lnk_cancel_btn.clicked.connect(self._tr_on_lnk_cancel)
+        row.addWidget(self._tr_lnk_cancel_btn)
+        ll.addLayout(row)
+
+        self._tr_lnk_progress = QProgressBar()
+        self._tr_lnk_progress.setVisible(False)
+        ll.addWidget(self._tr_lnk_progress)
+        self._tr_lnk_status = QLabel("")
+        ll.addWidget(self._tr_lnk_status)
+
         lnk.setLayout(ll)
         lay.addWidget(lnk)
 
-        # Solver
+        # ── SOLVER (ILP) sub-section ─────────────────────────────────────
         slv = QGroupBox("Solver (ILP)")
         sv = QVBoxLayout()
+
+        # Overwrite checkbox for solve
+        row = QHBoxLayout()
+        self._tr_overwrite_slv_chk = QCheckBox("Overwrite")
+        self._tr_overwrite_slv_chk.setChecked(True)
+        row.addWidget(self._tr_overwrite_slv_chk)
+        sv.addLayout(row)
 
         row = QHBoxLayout()
         row.addWidget(QLabel("Appear"))
@@ -1086,28 +1165,31 @@ class UltrackAnalysisWidget(QWidget):
         self._tr_window = QSpinBox()
         self._tr_window.setRange(0, 10_000)
         row.addWidget(self._tr_window)
-        row.addWidget(QLabel("Workers"))
-        self._tr_workers = QSpinBox()
-        self._tr_workers.setRange(1, 64)
-        self._tr_workers.setValue(1)
-        row.addWidget(self._tr_workers)
         sv.addLayout(row)
+
+        # Buttons for solve
+        row = QHBoxLayout()
+        self._tr_slv_run_btn = QPushButton("Run Solve")
+        self._tr_slv_run_btn.clicked.connect(self._tr_on_run_solve)
+        row.addWidget(self._tr_slv_run_btn)
+        self._tr_slv_cancel_btn = QPushButton("Cancel")
+        self._tr_slv_cancel_btn.setEnabled(False)
+        self._tr_slv_cancel_btn.clicked.connect(self._tr_on_slv_cancel)
+        row.addWidget(self._tr_slv_cancel_btn)
+        sv.addLayout(row)
+
+        self._tr_slv_progress = QProgressBar()
+        self._tr_slv_progress.setVisible(False)
+        sv.addWidget(self._tr_slv_progress)
+        self._tr_slv_status = QLabel("")
+        sv.addWidget(self._tr_slv_status)
 
         slv.setLayout(sv)
         lay.addWidget(slv)
 
-        # Overwrite
+        # ── Full pipeline buttons ────────────────────────────────────────
         row = QHBoxLayout()
-        row.addWidget(QLabel("Overwrite"))
-        self._tr_overwrite = QComboBox()
-        self._tr_overwrite.addItems(["all", "links", "solutions", "none"])
-        self._tr_overwrite.setCurrentText("all")
-        row.addWidget(self._tr_overwrite)
-        lay.addLayout(row)
-
-        # Buttons
-        row = QHBoxLayout()
-        self._tr_run_btn = QPushButton("Run Tracking")
+        self._tr_run_btn = QPushButton("Run Full Tracking Pipeline")
         self._tr_run_btn.clicked.connect(self._tr_on_run)
         row.addWidget(self._tr_run_btn)
         self._tr_term_btn = QPushButton("Run in Terminal")
@@ -1146,7 +1228,7 @@ class UltrackAnalysisWidget(QWidget):
             threshold=self._tr_seg_thresh.value(),
             ws_hierarchy=self._tr_ws_combo.currentText(),
             anisotropy_penalization=self._tr_aniso.value(),
-            n_workers=self._tr_workers.value(),
+            n_workers=self._tr_seg_workers.value(),
             max_distance=self._tr_max_dist.value(),
             max_neighbors=self._tr_max_nb.value(),
             distance_weight=self._tr_dist_w.value(),
@@ -1159,7 +1241,9 @@ class UltrackAnalysisWidget(QWidget):
             solution_gap=self._tr_gap.value(),
             time_limit=self._tr_time_limit.value(),
             window_size=self._tr_window.value(),
-            overwrite=self._tr_overwrite.currentText(),
+            overwrite_segmentation=self._tr_overwrite_seg_chk.isChecked(),
+            overwrite_linking=self._tr_overwrite_lnk_chk.isChecked(),
+            overwrite_solve=self._tr_overwrite_slv_chk.isChecked(),
         )
 
     def _tr_apply_config(self, cfg: TrackingConfig) -> None:
@@ -1169,7 +1253,7 @@ class UltrackAnalysisWidget(QWidget):
         self._tr_seg_thresh.setValue(cfg.threshold)
         self._tr_ws_combo.setCurrentText(cfg.ws_hierarchy)
         self._tr_aniso.setValue(cfg.anisotropy_penalization)
-        self._tr_workers.setValue(cfg.n_workers)
+        self._tr_seg_workers.setValue(cfg.n_workers)
         self._tr_max_dist.setValue(cfg.max_distance)
         self._tr_max_nb.setValue(cfg.max_neighbors)
         self._tr_dist_w.setValue(cfg.distance_weight)
@@ -1182,7 +1266,9 @@ class UltrackAnalysisWidget(QWidget):
         self._tr_gap.setValue(cfg.solution_gap)
         self._tr_time_limit.setValue(cfg.time_limit)
         self._tr_window.setValue(cfg.window_size)
-        self._tr_overwrite.setCurrentText(cfg.overwrite)
+        self._tr_overwrite_seg_chk.setChecked(cfg.overwrite_segmentation)
+        self._tr_overwrite_lnk_chk.setChecked(cfg.overwrite_linking)
+        self._tr_overwrite_slv_chk.setChecked(cfg.overwrite_solve)
 
     def _tr_on_run(self) -> None:
         paths = self._get_paths()
@@ -1229,7 +1315,6 @@ class UltrackAnalysisWidget(QWidget):
             f" --contours \"{ct_path}\""
             f" --working-dir \"{wd}\""
             f" --config \"{cfg_path}\""
-            f" --overwrite \"{cfg.overwrite}\""
         )
         try:
             launch_in_terminal(cmd)
@@ -1268,6 +1353,179 @@ class UltrackAnalysisWidget(QWidget):
         self._tr_progress.setVisible(False)
         self._tr_worker = None
         self._tr_status.setText(f"Error: {exc}")
+
+    # ── Per-stage run methods ────────────────────────────────────────────
+
+    def _tr_on_run_segmentation(self) -> None:
+        paths = self._get_paths()
+        if paths is None:
+            self._tr_seg_status.setText("Set input and output directories first.")
+            return
+        inp, out = paths
+        fg_path = str(Path(out) / "foreground.tif")
+        ct_path = str(Path(out) / "contours.tif")
+        wd = out
+        cfg = self._tr_build_config()
+        self._tr_seg_run_btn.setEnabled(False)
+        self._tr_seg_cancel_btn.setEnabled(True)
+        self._tr_seg_progress.setVisible(True)
+        self._tr_seg_status.setText("Starting\u2026")
+
+        @thread_worker(connect={
+            "yielded": self._tr_seg_on_progress,
+            "finished": self._tr_seg_on_finished,
+            "errored": self._tr_seg_on_error,
+        })
+        def _work():
+            for u in run_segmentation(fg_path, ct_path, wd, cfg, overwrite=cfg.overwrite_segmentation):
+                yield u
+
+        self._seg_worker = _work()
+        self._seg_worker.aborted.connect(self._tr_seg_on_cancelled)
+
+    def _tr_seg_on_progress(self, u: tuple) -> None:
+        done, total, label = u
+        self._tr_seg_progress.setMaximum(max(total, 1))
+        self._tr_seg_progress.setValue(done)
+        self._tr_seg_status.setText(label)
+
+    def _tr_on_seg_cancel(self) -> None:
+        if self._seg_worker is not None:
+            self._seg_worker.quit()
+
+    def _tr_seg_on_cancelled(self) -> None:
+        self._tr_seg_run_btn.setEnabled(True)
+        self._tr_seg_cancel_btn.setEnabled(False)
+        self._tr_seg_progress.setVisible(False)
+        self._seg_worker = None
+        self._tr_seg_status.setText("Cancelled.")
+
+    def _tr_seg_on_finished(self) -> None:
+        self._tr_seg_run_btn.setEnabled(True)
+        self._tr_seg_cancel_btn.setEnabled(False)
+        self._tr_seg_progress.setVisible(False)
+        self._seg_worker = None
+        self._tr_seg_status.setText("Segmentation complete.")
+
+    def _tr_seg_on_error(self, exc: Exception) -> None:
+        self._tr_seg_run_btn.setEnabled(True)
+        self._tr_seg_cancel_btn.setEnabled(False)
+        self._tr_seg_progress.setVisible(False)
+        self._seg_worker = None
+        self._tr_seg_status.setText(f"Error: {exc}")
+
+    def _tr_on_run_linking(self) -> None:
+        paths = self._get_paths()
+        if paths is None:
+            self._tr_lnk_status.setText("Set input and output directories first.")
+            return
+        _, out = paths
+        wd = out
+        cfg = self._tr_build_config()
+        self._tr_lnk_run_btn.setEnabled(False)
+        self._tr_lnk_cancel_btn.setEnabled(True)
+        self._tr_lnk_progress.setVisible(True)
+        self._tr_lnk_status.setText("Starting\u2026")
+
+        @thread_worker(connect={
+            "yielded": self._tr_lnk_on_progress,
+            "finished": self._tr_lnk_on_finished,
+            "errored": self._tr_lnk_on_error,
+        })
+        def _work():
+            for u in run_linking(wd, cfg, overwrite=cfg.overwrite_linking):
+                yield u
+
+        self._lnk_worker = _work()
+        self._lnk_worker.aborted.connect(self._tr_lnk_on_cancelled)
+
+    def _tr_lnk_on_progress(self, u: tuple) -> None:
+        done, total, label = u
+        self._tr_lnk_progress.setMaximum(max(total, 1))
+        self._tr_lnk_progress.setValue(done)
+        self._tr_lnk_status.setText(label)
+
+    def _tr_on_lnk_cancel(self) -> None:
+        if self._lnk_worker is not None:
+            self._lnk_worker.quit()
+
+    def _tr_lnk_on_cancelled(self) -> None:
+        self._tr_lnk_run_btn.setEnabled(True)
+        self._tr_lnk_cancel_btn.setEnabled(False)
+        self._tr_lnk_progress.setVisible(False)
+        self._lnk_worker = None
+        self._tr_lnk_status.setText("Cancelled.")
+
+    def _tr_lnk_on_finished(self) -> None:
+        self._tr_lnk_run_btn.setEnabled(True)
+        self._tr_lnk_cancel_btn.setEnabled(False)
+        self._tr_lnk_progress.setVisible(False)
+        self._lnk_worker = None
+        self._tr_lnk_status.setText("Linking complete.")
+
+    def _tr_lnk_on_error(self, exc: Exception) -> None:
+        self._tr_lnk_run_btn.setEnabled(True)
+        self._tr_lnk_cancel_btn.setEnabled(False)
+        self._tr_lnk_progress.setVisible(False)
+        self._lnk_worker = None
+        self._tr_lnk_status.setText(f"Error: {exc}")
+
+    def _tr_on_run_solve(self) -> None:
+        paths = self._get_paths()
+        if paths is None:
+            self._tr_slv_status.setText("Set input and output directories first.")
+            return
+        _, out = paths
+        wd = out
+        cfg = self._tr_build_config()
+        self._tr_slv_run_btn.setEnabled(False)
+        self._tr_slv_cancel_btn.setEnabled(True)
+        self._tr_slv_progress.setVisible(True)
+        self._tr_slv_status.setText("Starting\u2026")
+
+        @thread_worker(connect={
+            "yielded": self._tr_slv_on_progress,
+            "finished": self._tr_slv_on_finished,
+            "errored": self._tr_slv_on_error,
+        })
+        def _work():
+            for u in run_solve(wd, cfg, overwrite=cfg.overwrite_solve):
+                yield u
+
+        self._slv_worker = _work()
+        self._slv_worker.aborted.connect(self._tr_slv_on_cancelled)
+
+    def _tr_slv_on_progress(self, u: tuple) -> None:
+        done, total, label = u
+        self._tr_slv_progress.setMaximum(max(total, 1))
+        self._tr_slv_progress.setValue(done)
+        self._tr_slv_status.setText(label)
+
+    def _tr_on_slv_cancel(self) -> None:
+        if self._slv_worker is not None:
+            self._slv_worker.quit()
+
+    def _tr_slv_on_cancelled(self) -> None:
+        self._tr_slv_run_btn.setEnabled(True)
+        self._tr_slv_cancel_btn.setEnabled(False)
+        self._tr_slv_progress.setVisible(False)
+        self._slv_worker = None
+        self._tr_slv_status.setText("Cancelled.")
+
+    def _tr_slv_on_finished(self) -> None:
+        self._tr_slv_run_btn.setEnabled(True)
+        self._tr_slv_cancel_btn.setEnabled(False)
+        self._tr_slv_progress.setVisible(False)
+        self._slv_worker = None
+        self._tr_slv_status.setText("Solve complete \u2014 loading results\u2026")
+        self._tr_load_results()
+
+    def _tr_slv_on_error(self, exc: Exception) -> None:
+        self._tr_slv_run_btn.setEnabled(True)
+        self._tr_slv_cancel_btn.setEnabled(False)
+        self._tr_slv_progress.setVisible(False)
+        self._slv_worker = None
+        self._tr_slv_status.setText(f"Error: {exc}")
 
     def _tr_load_results(self) -> None:
         """Load tracks + tracked_labels into the napari viewer."""
@@ -1341,9 +1599,11 @@ class UltrackAnalysisWidget(QWidget):
         ct_ow = self._ct_overwrite_chk.isChecked()
         tr_cfg = self._tr_build_config()
 
-        # Tracking skip: skip when overwrite is "none" and outputs already exist
+        # Tracking skip: skip when all overwrite flags are False and outputs already exist
         tr_skip = (
-            tr_cfg.overwrite == "none"
+            not tr_cfg.overwrite_segmentation
+            and not tr_cfg.overwrite_linking
+            and not tr_cfg.overwrite_solve
             and (out_p / "tracks.csv").exists()
             and (out_p / "tracked_labels.tif").exists()
         )

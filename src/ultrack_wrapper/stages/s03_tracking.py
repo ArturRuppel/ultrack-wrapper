@@ -1,4 +1,4 @@
-"""s03 — Ultrack tracking (segment + link + solve)."""
+"""s03 — Ultrack tracking: segment, link, and solve as independent stages."""
 
 from __future__ import annotations
 
@@ -11,7 +11,12 @@ import numpy as np
 import tifffile
 
 from ultrack.config import MainConfig
-from ultrack.core.main import track
+from ultrack.core.database import clear_all_data
+from ultrack.core.linking.processing import link
+from ultrack.core.linking.utils import clear_linking_data
+from ultrack.core.segmentation.processing import segment
+from ultrack.core.solve.processing import solve
+from ultrack.core.solve.sqltracking import SQLTracking
 from ultrack.core.export.tracks_layer import to_tracks_layer
 from ultrack.core.export.ctc import to_ctc
 
@@ -66,35 +71,25 @@ def export_tracked_labels(
     cfg: TrackingConfig,
     output_path: str | Path,
 ) -> None:
-    """Export tracked segmentation labels as ``tracked_labels.tif``.
-
-    Each voxel in the output volume is labelled with its track ID (uint32).
-    The output shape matches the segmented volume: (T, [Z,] Y, X).
-
-    First tries the native ``ultrack.core.export.labels.to_labels`` API; falls
-    back to reconstructing from a CTC export if that function is unavailable.
-    """
+    """Export tracked segmentation labels as ``tracked_labels.tif``."""
     wd = Path(working_dir)
     ultrack_cfg = _build_ultrack_config(cfg, wd)
     output_path = Path(output_path)
 
-    # Attempt native labels export
     try:
         from ultrack.core.export.labels import to_labels  # type: ignore[import]
 
         labels = to_labels(ultrack_cfg)
-        if hasattr(labels, "compute"):  # dask array
+        if hasattr(labels, "compute"):
             labels = labels.compute()
         tifffile.imwrite(str(output_path), labels.astype(np.uint32), compression="zlib")
         return
     except (ImportError, Exception):
         pass
 
-    # Fallback: reconstruct from CTC export
     tmpdir = Path(tempfile.mkdtemp(prefix="ultrack_labels_"))
     try:
         to_ctc(tmpdir, ultrack_cfg, overwrite=True)
-        # Search recursively — to_ctc may write to TRA/, RES/, or flat
         mask_files = sorted(tmpdir.rglob("mask*.tif"))
         if not mask_files:
             mask_files = sorted(tmpdir.rglob("man_track*.tif"))
@@ -111,22 +106,110 @@ def export_tracked_labels(
 
 
 def get_labels_layer(working_dir: str | Path) -> np.ndarray:
-    """Load ``tracked_labels.tif`` from *working_dir* for napari visualisation.
-
-    Returns
-    -------
-    np.ndarray
-        Integer label array shaped (T, [Z,] Y, X).
-
-    Raises
-    ------
-    FileNotFoundError
-        If ``tracked_labels.tif`` does not exist in *working_dir*.
-    """
+    """Load ``tracked_labels.tif`` from *working_dir* for napari visualisation."""
     labels_path = Path(working_dir) / "tracked_labels.tif"
     if not labels_path.exists():
         raise FileNotFoundError(f"tracked_labels.tif not found in {working_dir}")
     return tifffile.imread(str(labels_path))
+
+
+# ── Independent stage runners ─────────────────────────────────────────────────
+
+def run_segmentation(
+    foreground_path: str | Path,
+    contours_path: str | Path,
+    working_dir: str | Path,
+    cfg: TrackingConfig,
+    overwrite: bool = True,
+) -> Generator[tuple[int, int, str], None, None]:
+    """Run only the segmentation (add_nodes) step.
+
+    Yields ``(step, total_steps, status_label)``.
+    """
+    total = 4
+    fg_path = Path(foreground_path)
+    ct_path = Path(contours_path)
+
+    if not fg_path.exists():
+        raise FileNotFoundError(f"Foreground stack not found: {fg_path}\nRun the Foreground stage first.")
+    if not ct_path.exists():
+        raise FileNotFoundError(f"Contours stack not found: {ct_path}\nRun the Contours stage first.")
+
+    yield (0, total, "Loading stacks…")
+    foreground = load_stack(fg_path)
+    contours = load_stack(ct_path)
+
+    wd = Path(working_dir)
+    wd.mkdir(parents=True, exist_ok=True)
+    ultrack_cfg = _build_ultrack_config(cfg, wd)
+
+    if overwrite:
+        yield (1, total, "Clearing existing segmentation from DB…")
+        clear_all_data(ultrack_cfg.data_config.database_path)
+    else:
+        yield (1, total, "Skipping DB clear (overwrite=False)…")
+
+    yield (2, total, "Running segmentation (add nodes)…")
+    segment(foreground, contours, ultrack_cfg)
+
+    yield (total, total, "Segmentation done.")
+
+
+def run_linking(
+    working_dir: str | Path,
+    cfg: TrackingConfig,
+    overwrite: bool = True,
+) -> Generator[tuple[int, int, str], None, None]:
+    """Run only the linking (add_edges) step.
+
+    Yields ``(step, total_steps, status_label)``.
+    """
+    total = 3
+    wd = Path(working_dir)
+    ultrack_cfg = _build_ultrack_config(cfg, wd)
+
+    if overwrite:
+        yield (0, total, "Clearing existing links from DB…")
+        clear_linking_data(ultrack_cfg.data_config.database_path)
+    else:
+        yield (0, total, "Skipping DB clear (overwrite=False)…")
+
+    yield (1, total, "Running linking (add edges)…")
+    link(ultrack_cfg)
+
+    yield (total, total, "Linking done.")
+
+
+def run_solve(
+    working_dir: str | Path,
+    cfg: TrackingConfig,
+    overwrite: bool = True,
+) -> Generator[tuple[int, int, str], None, None]:
+    """Run only the solve (ILP) step and export results.
+
+    Yields ``(step, total_steps, status_label)``.
+    """
+    total = 5
+    wd = Path(working_dir)
+    ultrack_cfg = _build_ultrack_config(cfg, wd)
+
+    if overwrite:
+        yield (0, total, "Clearing existing solution from DB…")
+        SQLTracking.clear_solution_from_database(ultrack_cfg.data_config.database_path)
+    else:
+        yield (0, total, "Skipping DB clear (overwrite=False)…")
+
+    yield (1, total, "Running ILP solve…")
+    solve(ultrack_cfg)
+
+    yield (2, total, "Exporting tracks CSV…")
+    tracks_df, _ = to_tracks_layer(ultrack_cfg)
+    tracks_df.to_csv(str(wd / "tracks.csv"), index=True)
+
+    yield (3, total, "Exporting tracked labels…")
+    export_tracked_labels(wd, cfg, wd / "tracked_labels.tif")
+
+    yield (total, total, "Solve done.")
 
 
 def run(
@@ -135,54 +218,33 @@ def run(
     working_dir: str | Path,
     cfg: TrackingConfig,
 ) -> Generator[tuple[int, int, str], None, None]:
-    """Run Ultrack tracking pipeline.
+    """Run the full Ultrack pipeline (segment → link → solve).
 
-    Yields ``(step, total_steps, status_label)`` for progress reporting.
+    Respects ``cfg.overwrite_segmentation``, ``cfg.overwrite_linking``,
+    and ``cfg.overwrite_solve``.
+
+    Yields ``(step, total_steps, status_label)``.
     """
-    total = 6
+    total = 12
 
-    fg_path = Path(foreground_path)
-    if not fg_path.exists():
-        raise FileNotFoundError(
-            f"Foreground stack not found: {fg_path}\n"
-            "Run the Foreground stage first."
-        )
-    ct_path = Path(contours_path)
-    if not ct_path.exists():
-        raise FileNotFoundError(
-            f"Contours stack not found: {ct_path}\n"
-            "Run the Contours stage first."
-        )
+    # Segmentation
+    for step, sub_total, label in run_segmentation(
+        foreground_path, contours_path, working_dir, cfg,
+        overwrite=cfg.overwrite_segmentation,
+    ):
+        yield (int(step / max(sub_total, 1) * 4), total, f"[Seg] {label}")
 
-    yield (0, total, "Loading foreground stack...")
-    foreground = load_stack(fg_path)
-    yield (1, total, "Loading contours stack...")
-    contours = load_stack(ct_path)
-    yield (2, total, "Building Ultrack config...")
+    # Linking
+    for step, sub_total, label in run_linking(
+        working_dir, cfg, overwrite=cfg.overwrite_linking,
+    ):
+        yield (4 + int(step / max(sub_total, 1) * 3), total, f"[Link] {label}")
 
-    wd = Path(working_dir)
-    wd.mkdir(parents=True, exist_ok=True)
-
-    ultrack_cfg = _build_ultrack_config(cfg, wd)
-    overwrite = cfg.overwrite if cfg.overwrite != "none" else "none"
-
-    yield (3, total, "Running tracking (segment + link + solve)...")
-
-    track(
-        ultrack_cfg,
-        foreground=foreground,
-        contours=contours,
-        overwrite=overwrite,
-    )
-
-    yield (4, total, "Exporting tracks CSV...")
-
-    tracks_df, graph = to_tracks_layer(ultrack_cfg)
-    tracks_df.to_csv(str(wd / "tracks.csv"), index=True)
-
-    yield (5, total, "Exporting tracked labels...")
-
-    export_tracked_labels(wd, cfg, wd / "tracked_labels.tif")
+    # Solve + export
+    for step, sub_total, label in run_solve(
+        working_dir, cfg, overwrite=cfg.overwrite_solve,
+    ):
+        yield (7 + int(step / max(sub_total, 1) * 5), total, f"[Solve] {label}")
 
     yield (total, total, "Done")
 
@@ -202,20 +264,10 @@ def get_tracks_layer(
     working_dir: str | Path,
     cfg: TrackingConfig,
 ):
-    """Load tracks layer data for napari visualization.
-
-    Returns
-    -------
-    tracks_df : pd.DataFrame
-        Columns: track_id, t, (z), y, x
-    graph : dict
-        Lineage graph mapping track_id -> [parent_track_id]
-    """
+    """Load tracks layer data for napari visualization."""
     wd = Path(working_dir)
     ultrack_cfg = _build_ultrack_config(cfg, wd)
     tracks_df, graph = to_tracks_layer(ultrack_cfg)
-
-    # napari add_tracks requires exactly 4 or 5 columns: track_id, t, [z], y, x
     spatial_cols = [c for c in tracks_df.columns if c in {"track_id", "t", "z", "y", "x"}]
     return tracks_df[spatial_cols], graph
 
@@ -233,20 +285,18 @@ if __name__ == "__main__":
     parser.add_argument("--foreground", required=True, help="Path to foreground.tif stack")
     parser.add_argument("--contours", required=True, help="Path to contours.tif stack")
     parser.add_argument("--working-dir", required=True, help="Ultrack working/output directory")
-    parser.add_argument(
-        "--config",
-        default=None,
-        help="Path to JSON file with TrackingConfig fields (optional)",
-    )
-    # Flat overrides for the most common params
-    parser.add_argument("--overwrite", default="all",
-                        choices=["all", "links", "solutions", "none"])
+    parser.add_argument("--config", default=None, help="Path to JSON file with TrackingConfig fields")
+    parser.add_argument("--overwrite-segmentation", action="store_true", default=True)
+    parser.add_argument("--overwrite-linking", action="store_true", default=True)
+    parser.add_argument("--overwrite-solve", action="store_true", default=True)
     args = parser.parse_args()
 
     cfg_dict: dict = {}
     if args.config:
         cfg_dict = json.loads(Path(args.config).read_text())
-    cfg_dict.setdefault("overwrite", args.overwrite)
+    cfg_dict.setdefault("overwrite_segmentation", args.overwrite_segmentation)
+    cfg_dict.setdefault("overwrite_linking", args.overwrite_linking)
+    cfg_dict.setdefault("overwrite_solve", args.overwrite_solve)
     cfg = TrackingConfig(**cfg_dict)
 
     for step, total, label in run(args.foreground, args.contours, args.working_dir, cfg):

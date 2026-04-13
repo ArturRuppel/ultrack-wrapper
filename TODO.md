@@ -1,115 +1,113 @@
 # TODO
 
-## Redesign: Unified Foreground + Contours + Tracking Widget
+## Widget layout redesign: collapsible sections with header checkboxes
 
-Merge the three separate widgets (`_widget_foreground.py`, `_widget_contours.py`,
-`_widget_tracking.py`) into a single cohesive widget that lives in its own
-sub-package. The widget should present the three stages as collapsible sections
-or sub-tabs within one panel, not as three independent tabs.
+Every stage section (Foreground, Contours, Segmentation, Linking, Solve,
+Results) should be a **collapsible panel** whose header row contains:
 
-### Structural changes
+- A **enable/disable checkbox** (or overwrite checkbox for cached stages) on
+  the left of the title — controls whether "Run All" will execute this step.
+- The **section title** label.
+- A **collapse/expand toggle** (arrow or +/−) on the right.
 
-- Create a new folder `src/ultrack_wrapper/widgets/` to house all widget code.
-  Move (and rename as appropriate):
-  - `_widget_foreground.py`  →  `widgets/foreground.py`
-  - `_widget_contours.py`    →  `widgets/contours.py`
-  - `_widget_tracking.py`    →  `widgets/tracking.py`
-  - Add `widgets/__init__.py` that exports the new unified widget class.
-- Create `widgets/ultrack_widget.py` — the top-level `QWidget` that composes
-  the three stage panels (foreground, contours, tracking) into one docked widget.
-- Update `widget.py` (the main `QTabWidget`) to import from `widgets/` instead
-  of the old flat `_widget_*.py` files.
-- Remove the now-redundant flat `_widget_foreground.py`, `_widget_contours.py`,
-  `_widget_tracking.py` files once the new layout is wired up.
+The config parameters live *inside* the collapsible body. The checkbox is
+**never** inside the collapsed area — it stays visible at all times so the
+user can toggle a step without having to expand it first.
 
-### No per-frame intermediate saves
-
-- Remove the existing per-timepoint intermediate file output for foreground and
-  contours (currently written as `foreground.tif` / `contours.tif` stacks at
-  the end of a full run; make sure no frame-by-frame `.tif` files are written
-  during preview or partial runs).
-- The final outputs of foreground and contours stages should remain single
-  multi-timepoint stacks (T, Y, X), written only when "Run" is clicked.
-
-### Run modes — intermediate steps separately or all-at-once
-
-Each stage section (Foreground, Contours, Tracking) should have its own **Run**
-button so stages can be executed independently. In addition, add a top-level
-**Run All** button that chains all three stages in order. Suggested layout:
+Sketch of one section header:
 
 ```
-[Run Foreground]   [Run Contours]   [Run Tracking]
-                   [Run All]
+[✓] ▶  Segmentation                                    [▲]
 ```
 
-The "Run All" flow should be:
-1. Foreground → check overwrite → run if needed
-2. Contours   → check overwrite → run if needed
-3. Tracking   → run (always, or add its own overwrite check)
+When collapsed only the header row is shown. When expanded the parameter
+widgets appear below it.
 
-### Overwrite checkbox
+---
 
-- Each stage section should have its own **Overwrite** checkbox (already present
-  in foreground and contours; add one for tracking to replace/complement the
-  existing `overwrite` combo-box).
-- When **Overwrite** is unchecked and the output file for that stage already
-  exists on disk, skip re-running that stage (both for per-stage runs and when
-  invoked via "Run All").
-- Display a short status message when a stage is skipped, e.g.
-  `"Skipping foreground — output exists (overwrite unchecked)"`.
+## Split the Tracking section into three independent pipeline stages
 
-### Run in terminal button
+The current Tracking section runs `add_nodes` (segmentation candidates),
+`add_edges` (linking), and `track` (ILP solve) as one monolithic step. These
+should become **three separate collapsible sections**, each with its own
+**Run** button and **enable/disable checkbox** in the header:
 
-Add a **Run in Terminal** button next to each stage's **Run** button (and
-optionally one for "Run All"). Clicking it should:
+### New sections
 
-1. Serialize the current widget parameters to a temporary JSON config file (or
-   pass them as CLI arguments).
-2. Build a command such as:
-   ```
-   python -m ultrack_wrapper.stages.s02_foreground \
-     --input-dir /path/to/1a_cellpose_nucleus \
-     --output-dir /path/to/2_foreground \
-     --config /tmp/ultrack_fg_config.json \
-     --overwrite
-   ```
-3. Launch the command in a new OS terminal using the existing
-   `runners/terminal.py` infrastructure:
-   - Linux:  `gnome-terminal -- bash -c "CMD; exec bash"`
-   - macOS:  `osascript -e 'tell app "Terminal" to do script "CMD"'`
-   - Windows: `start cmd /k CMD`
-4. Each stage script (`s02_foreground.py`, `s02b_contours.py`, `s03_tracking.py`)
-   needs a `__main__` entry point (argparse + `--config` JSON or individual
-   `--param` flags) so it can be invoked from the command line.
+| Section | Wraps | Cached in DB |
+|---|---|---|
+| **Segmentation** | `ultrack add_nodes` — detects candidates from foreground/contours | `nodes` table |
+| **Linking** | `ultrack add_edges` — scores candidate links between frames | `edges` table |
+| **Solve** | `ultrack track` (ILP only) — selects optimal solution | `solution` table |
 
-This feature depends on the stage modules having CLI entry points — implement
-those first before wiring up the button.
+Each section gets:
+- A collapsible config panel (its relevant parameter knobs).
+- A **Run** button that executes only that step.
+- A header **enable/disable checkbox**: when unchecked, "Run All" skips the
+  step and reuses the cached DB result.
 
-### Tracking output: tracked_labels.tif
+### Motivation
 
-- After tracking completes, export a `tracked_labels.tif` (T, Z, Y, X or T, Y, X)
-  where each voxel is labelled with its track ID — in addition to the existing
-  tracks CSV/zarr output.
-- Load **both** outputs into the napari viewer:
-  - The tracks layer (existing behaviour).
-  - The `tracked_labels.tif` as a `Labels` layer.
-- This loading should happen in **two places**:
-  1. When the user clicks the **Load** button for the tracking stage (load
-     pre-existing results from disk without re-running).
-  2. Automatically upon successful completion of a tracking run (either via
-     "Run Tracking" or "Run All").
+Tuning solver weights (`appear_weight`, `disappear_weight`, `division_weight`,
+`bias`, `solution_gap`) does not require re-segmenting or re-linking. Keeping
+those cached cuts iteration time significantly on large datasets. The checkbox
+makes the intent explicit: "I want to reuse the existing candidates/links and
+only re-solve."
 
-### Implementation order
+### Config split
 
-1. Add `__main__` CLI entry points to `s02_foreground.py`, `s02b_contours.py`,
-   and `s03_tracking.py`.
-2. Create `src/ultrack_wrapper/widgets/` sub-package with `__init__.py`.
-3. Port and refactor the three widget classes into `widgets/foreground.py`,
-   `widgets/contours.py`, `widgets/tracking.py`.
-4. Build `widgets/ultrack_widget.py` — the unified composite widget with
-   per-stage run buttons, a "Run All" button, overwrite checkboxes, and
-   "Run in Terminal" buttons.
-5. Update `widget.py` (main `QTabWidget`) to use the new composite widget.
-6. Delete the old `_widget_*.py` files.
-7. Test the full flow: Preview → Run Foreground → Run Contours → Run Tracking →
-   Run All (with and without overwrite).
+Current `TrackingConfig` fields should be distributed across the three sections:
+
+- **Segmentation config**: `min_area`, `max_area`, `min_frontier`, `threshold`,
+  `ws_hierarchy`, `anisotropy_penalization`, `n_workers`
+- **Linking config**: `max_distance`, `max_neighbors`, `distance_weight`,
+  `n_workers`
+- **Solve config**: `appear_weight`, `disappear_weight`, `division_weight`,
+  `link_function`, `power`, `bias`, `solution_gap`, `time_limit`,
+  `window_size`
+
+### Implementation notes
+
+- Replace the existing `TrackingConfig.overwrite` string enum with three `bool`
+  fields: `overwrite_segmentation`, `overwrite_linking`, `overwrite_solve` —
+  driven by the three header checkboxes.
+- Split `s03_tracking.py:run()` into three functions: `run_segmentation()`,
+  `run_linking()`, `run_solve()`, each callable independently.
+- "Run All" at the top level chains all enabled sections in order.
+
+---
+
+## Database inspection tab in the Tracking section
+
+Add an **"Inspect DB"** sub-tab inside the Tracking area (alongside the
+existing Results tab). The goal is to let the user interrogate the ultrack
+SQLite database interactively from within napari.
+
+### What the DB contains that is not yet visible
+
+| Data | Currently exposed |
+|---|---|
+| Final track centroids + lineage | Yes (Tracks layer via Load Results) |
+| Final voxel segmentation | Yes (tracked_labels.tif via Load Results) |
+| **All segmentation candidates** (including rejected ones) | No |
+| **All candidate links** (scored hypotheses) | No |
+| **Division events** specifically | No |
+| **Per-segment ILP scores / weights** | No |
+
+### "Inspect DB" tab contents
+
+- **Load candidates** button: reads all candidate centroids from the DB, adds
+  them as a `Points` layer coloured by selection status (chosen vs. rejected).
+- **Load links** button: reads all candidate links, adds them as a `Vectors`
+  layer with opacity/thickness scaled by link score.
+- **Load divisions** button: filters solution links for division events and
+  adds them as a distinct `Points` layer.
+- **Colour by** combo-box: re-colours the Points layer by a chosen per-candidate
+  scalar (area, ILP weight, link score, …).
+
+### Implementation notes
+
+- Query the DB via `sqlalchemy` or `sqlite3` — ultrack uses tables `nodes`,
+  `edges`, and `solution` (verify exact names from ultrack source).
+- All DB reads should run in a `thread_worker`.
+- Use `_get_paths()` + `MainConfig.data.working_dir` to locate `data.db`.
