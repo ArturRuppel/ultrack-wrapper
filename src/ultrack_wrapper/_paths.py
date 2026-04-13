@@ -12,6 +12,7 @@ _STAGE_PREFIX: dict[str, str] = {
     "cellpose_nucleus": "1a_cellpose_nucleus",
     "cellpose_cell": "1b_cellpose_cell",
     "foreground": "2_foreground",
+    "contours": "2b_contours",
     "tracking": "3_tracking",
     "proj2d": "4_proj2d",
     "cell_labels": "5_cell_labels",
@@ -60,6 +61,13 @@ def cellpose_cell_dir(root_dir: str | Path, pos: int) -> Path:
 
 def foreground_dir(root_dir: str | Path, pos: int) -> Path:
     return stage_dir(root_dir, "foreground", pos)
+
+
+# ── Contours (s02b) ────────────────────────────────────────────────────────
+
+
+def contours_dir(root_dir: str | Path, pos: int) -> Path:
+    return stage_dir(root_dir, "contours", pos)
 
 
 # ── Tracking (s03) ──────────────────────────────────────────────────────────

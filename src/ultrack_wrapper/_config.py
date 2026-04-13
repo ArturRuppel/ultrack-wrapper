@@ -54,13 +54,55 @@ class ForegroundConfig(BaseModel):
     distance_filter_min_radius: float = 3.0
 
 
+class ContoursConfig(BaseModel):
+    """Parameters for contour/edge map generation (s02b).
+
+    Methods (from test_contour_approaches_v2.py):
+      - probmap:   1 - sigmoid(prob), Gaussian-smoothed
+      - watershed: multi-scale watershed UCM (boundary averaging)
+      - combined:  weighted blend of probmap + watershed
+    """
+
+    method: str = "combined"  # "probmap", "watershed", or "combined"
+    smooth_sigma: float = 1.0
+    # Combined weights (must sum to 1)
+    w_prob: float = 0.4
+    w_ws: float = 0.6
+    # Watershed parameters
+    min_seed_dist: int = 5
+    fg_thresh: float = 0.3
+
+
 class TrackingConfig(BaseModel):
     """Parameters for Ultrack tracking (s03)."""
 
+    # Segmentation hypothesis
     min_area: int = 100
-    max_area: int = 100000
+    max_area: int = 1000000
     min_frontier: float = 0.0
-    max_distance: float = 50.0
+    threshold: float = 0.5
+    ws_hierarchy: str = "area"  # "area", "dynamics", or "volume"
+    anisotropy_penalization: float = 0.0
+    n_workers: int = 1
+
+    # Linking
+    max_distance: float = 15.0
+    max_neighbors: int = 5
+    distance_weight: float = 0.0
+
+    # Solver / ILP
+    appear_weight: float = -0.001
+    disappear_weight: float = -0.001
+    division_weight: float = -0.001
+    link_function: str = "power"  # "power" or "identity"
+    power: float = 4.0
+    bias: float = 0.0
+    solution_gap: float = 0.001
+    time_limit: int = 36000
+    window_size: int = 0  # 0 = solve all at once
+
+    # Overwrite mode
+    overwrite: str = "all"  # "all", "links", "solutions", "none"
 
 
 class ProjectConfig(BaseModel):
@@ -69,4 +111,5 @@ class ProjectConfig(BaseModel):
     dataset: DatasetConfig
     cellpose: CellposeConfig = CellposeConfig()
     foreground: ForegroundConfig = ForegroundConfig()
+    contours: ContoursConfig = ContoursConfig()
     tracking: TrackingConfig = TrackingConfig()
