@@ -409,6 +409,8 @@ class UltrackAnalysisWidget(QWidget):
             self._cp_ct_status.setText("Error: no cellprob thresholds generated")
             return
 
+        self._cp_ct_status.setText(f"Computing {len(thresholds)} threshold(s): {[round(t, 2) for t in thresholds]}")
+
         cfg = self._cp_ct_build_config()
 
         # Single frame processing
@@ -416,13 +418,14 @@ class UltrackAnalysisWidget(QWidget):
         labels_list = []
         fg_list = []
 
-        for thresh in thresholds:
+        for i, thresh in enumerate(thresholds):
             cfg.cellprob_threshold = thresh
             try:
                 labels, fg, contours = compute_cp_contours_single(dp_data, prob_data, cfg)
                 labels_list.append(labels)
                 fg_list.append(fg)
                 contours_list.append(contours)
+                print(f"Threshold {i+1}/{len(thresholds)}: {thresh:.2f} - {len(np.unique(labels))} unique labels")
             except Exception as e:
                 self._cp_ct_status.setText(f"Error computing threshold {thresh}: {e}")
                 return
