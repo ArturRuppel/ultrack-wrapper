@@ -459,8 +459,7 @@ class UltrackAnalysisWidget(QWidget):
             self._cp_ct_fg_layer.data = fg_stack
 
         threshold_count = len(thresholds)
-        frame_count = num_frames if is_stack else 1
-        self._cp_ct_status.setText(f"Preview: {frame_count} frame(s) × {threshold_count} threshold(s)")
+        self._cp_ct_status.setText(f"Preview: 1 frame × {threshold_count} threshold(s) averaged")
 
     def _cp_ct_on_run(self) -> None:
         """Run cellpose contours stage in background."""
