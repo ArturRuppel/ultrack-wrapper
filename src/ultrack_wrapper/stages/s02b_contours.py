@@ -251,34 +251,69 @@ def run(
     cfg: ContoursConfig,
     overwrite: bool = False,
 ) -> Generator[tuple[int, int, str], None, None]:
-    """Process all timepoints, writing per-frame and stacked contour TIFFs.
+    """Process all timepoints and write a single stacked ``contours.tif``.
 
     Yields ``(done, total, status_label)`` for progress reporting.
+    If ``contours.tif`` already exists and *overwrite* is ``False``, the run
+    is skipped immediately.
     """
+    out = Path(output_dir)
+    out_path = out / "contours.tif"
+
+    if out_path.exists() and not overwrite:
+        yield (0, 1, "contours.tif already exists, skipping")
+        return
+
     prob_files = discover_prob_files(input_dir)
     total = len(prob_files)
     if total == 0:
         yield (0, 0, "No t*_prob.tif files found")
         return
 
-    out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
     frames: list[np.ndarray] = []
     for i, prob_path in enumerate(prob_files):
         t_str = prob_path.name.split("_")[0]
-        out_path = out / f"{t_str}_contours.tif"
-
-        if out_path.exists() and not overwrite:
-            frame = tifffile.imread(str(out_path))
-        else:
-            contours, _fg = compute_contours_single(prob_path, cfg)
-            frame = contours
-            tifffile.imwrite(str(out_path), frame, compression="zlib")
-
-        frames.append(frame)
-        yield (i + 1, total, f"{t_str}")
+        contours, _fg = compute_contours_single(prob_path, cfg)
+        frames.append(contours)
+        yield (i + 1, total, t_str)
 
     stacked = np.stack(frames, axis=0)
-    tifffile.imwrite(str(out / "contours.tif"), stacked, compression="zlib")
+    tifffile.imwrite(str(out_path), stacked, compression="zlib")
     yield (total, total, "Done")
+
+
+# ── CLI entry point ──────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import argparse
+    import json
+    import sys
+
+    parser = argparse.ArgumentParser(
+        description="s02b — compute contour maps from Cellpose prob maps",
+    )
+    parser.add_argument("--input-dir", required=True,
+                        help="Directory containing t*_prob.tif files")
+    parser.add_argument("--output-dir", required=True,
+                        help="Directory to write contour TIFFs")
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Path to JSON file with ContoursConfig fields (optional)",
+    )
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Overwrite existing per-timepoint files")
+    args = parser.parse_args()
+
+    cfg_dict: dict = {}
+    if args.config:
+        cfg_dict = json.loads(Path(args.config).read_text())
+    cfg = ContoursConfig(**cfg_dict)
+
+    for done, total, label in run(args.input_dir, args.output_dir, cfg,
+                                   overwrite=args.overwrite):
+        print(f"[{done}/{total}] {label}", flush=True)
+
+    sys.exit(0)

@@ -1,8 +1,9 @@
-"""Tracking tab — s03 Ultrack segment + link + solve."""
+"""Tracking panel — s03 Ultrack segment + link + solve."""
 
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -26,8 +27,10 @@ from qtpy.QtWidgets import (
 from napari.qt.threading import thread_worker
 
 from ultrack_wrapper._config import TrackingConfig
+from ultrack_wrapper.runners.terminal import launch_in_terminal
 from ultrack_wrapper.stages.s03_tracking import (
     export_ctc,
+    get_labels_layer,
     get_tracks_layer,
     run as run_s03,
 )
@@ -252,13 +255,19 @@ class TrackingWidget(QWidget):
         row.addWidget(self._overwrite_combo)
         layout.addLayout(row)
 
-        # ── Action buttons ───────────────────────────────────────────────
+        # ── Run buttons ──────────────────────────────────────────────────
+        row = QHBoxLayout()
         self._run_btn = QPushButton("Run Tracking")
         self._run_btn.clicked.connect(self._on_run)
-        layout.addWidget(self._run_btn)
+        row.addWidget(self._run_btn)
+        self._run_terminal_btn = QPushButton("Run in Terminal")
+        self._run_terminal_btn.clicked.connect(self._on_run_terminal)
+        row.addWidget(self._run_terminal_btn)
+        layout.addLayout(row)
 
-        self._load_btn = QPushButton("Load Tracks into Viewer")
-        self._load_btn.clicked.connect(self._on_load_tracks)
+        # ── Load / Export ────────────────────────────────────────────────
+        self._load_btn = QPushButton("Load Results into Viewer")
+        self._load_btn.clicked.connect(self._on_load_results)
         layout.addWidget(self._load_btn)
 
         self._export_ctc_btn = QPushButton("Export CTC\u2026")
@@ -363,9 +372,7 @@ class TrackingWidget(QWidget):
         if not fg_path or not contours_path or not wd:
             self._status_label.setText("Set foreground, contours, and working directory.")
             return
-
         cfg = self._build_config()
-
         self._run_btn.setEnabled(False)
         self._progress.setVisible(True)
         self._progress.setValue(0)
@@ -384,6 +391,30 @@ class TrackingWidget(QWidget):
 
         self._worker = _work()
 
+    def _on_run_terminal(self) -> None:
+        fg_path = self._fg_edit.text().strip()
+        contours_path = self._contours_edit.text().strip()
+        wd = self._wd_edit.text().strip()
+        if not fg_path or not contours_path or not wd:
+            self._status_label.setText("Set foreground, contours, and working directory.")
+            return
+        cfg = self._build_config()
+        cfg_path = Path(tempfile.mktemp(suffix="_tracking_config.json"))
+        cfg_path.write_text(json.dumps(cfg.model_dump(), indent=2))
+        cmd = (
+            f"python -m ultrack_wrapper.stages.s03_tracking"
+            f" --foreground \"{fg_path}\""
+            f" --contours \"{contours_path}\""
+            f" --working-dir \"{wd}\""
+            f" --config \"{cfg_path}\""
+            f" --overwrite \"{cfg.overwrite}\""
+        )
+        try:
+            launch_in_terminal(cmd)
+            self._status_label.setText("Launched tracking stage in terminal.")
+        except Exception as e:
+            self._status_label.setText(f"Terminal launch error: {e}")
+
     def _on_progress(self, update: tuple) -> None:
         done, total, label = update
         self._progress.setMaximum(max(total, 1))
@@ -393,8 +424,9 @@ class TrackingWidget(QWidget):
     def _on_finished(self) -> None:
         self._run_btn.setEnabled(True)
         self._progress.setVisible(False)
-        self._status_label.setText("Tracking complete. Load tracks into viewer.")
+        self._status_label.setText("Tracking complete \u2014 loading results into viewer\u2026")
         self._worker = None
+        self._load_results_into_viewer()
 
     def _on_error(self, exc: Exception) -> None:
         self._run_btn.setEnabled(True)
@@ -402,27 +434,44 @@ class TrackingWidget(QWidget):
         self._status_label.setText(f"Error: {exc}")
         self._worker = None
 
-    # ── Load tracks ─────────────────────────────────────────────────────
+    # ── Load results (tracks + labels) ──────────────────────────────────
 
-    def _on_load_tracks(self) -> None:
+    def _load_results_into_viewer(self) -> None:
+        """Load tracks layer and tracked_labels layer from disk into napari."""
         wd = self._wd_edit.text().strip()
         if not wd:
             self._status_label.setText("Set working directory first.")
             return
 
         cfg = self._build_config()
+        msgs: list[str] = []
+
+        # Tracks layer
         try:
             tracks_df, graph = get_tracks_layer(wd, cfg)
+            data = tracks_df.values
+            self.viewer.add_tracks(data, graph=graph, name="ultrack tracks")
+            msgs.append(
+                f"{tracks_df.iloc[:, 0].nunique()} tracks"
+                f" ({len(tracks_df)} points)"
+            )
         except Exception as e:
-            self._status_label.setText(f"Error loading tracks: {e}")
-            return
+            msgs.append(f"tracks error: {e}")
 
-        data = tracks_df.values
-        self.viewer.add_tracks(data, graph=graph, name="ultrack tracks")
-        self._status_label.setText(
-            f"Loaded {len(tracks_df)} track points, "
-            f"{tracks_df.iloc[:, 0].nunique()} tracks."
-        )
+        # Tracked labels layer
+        try:
+            labels = get_labels_layer(wd)
+            self.viewer.add_labels(labels, name="tracked labels")
+            msgs.append(f"labels {labels.shape}")
+        except FileNotFoundError:
+            msgs.append("tracked_labels.tif not found")
+        except Exception as e:
+            msgs.append(f"labels error: {e}")
+
+        self._status_label.setText("Loaded: " + " | ".join(msgs))
+
+    def _on_load_results(self) -> None:
+        self._load_results_into_viewer()
 
     # ── Export CTC ──────────────────────────────────────────────────────
 
@@ -431,11 +480,9 @@ class TrackingWidget(QWidget):
         if not wd:
             self._status_label.setText("Set working directory first.")
             return
-
         output_dir = QFileDialog.getExistingDirectory(self, "Select CTC output directory")
         if not output_dir:
             return
-
         cfg = self._build_config()
         try:
             export_ctc(wd, output_dir, cfg)

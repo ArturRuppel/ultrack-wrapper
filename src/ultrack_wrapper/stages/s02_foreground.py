@@ -210,34 +210,69 @@ def run(
     cfg: ForegroundConfig,
     overwrite: bool = False,
 ) -> Generator[tuple[int, int, str], None, None]:
-    """Process all timepoints, writing per-frame TIFFs and a stacked volume.
+    """Process all timepoints and write a single stacked ``foreground.tif``.
 
     Yields ``(done, total, status_label)`` for progress reporting.
+    If ``foreground.tif`` already exists and *overwrite* is ``False``, the run
+    is skipped immediately.
     """
+    out = Path(output_dir)
+    out_path = out / "foreground.tif"
+
+    if out_path.exists() and not overwrite:
+        yield (0, 1, "foreground.tif already exists, skipping")
+        return
+
     prob_files = discover_prob_files(input_dir)
     total = len(prob_files)
     if total == 0:
         yield (0, 0, "No t*_prob.tif files found")
         return
 
-    out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
     frames: list[np.ndarray] = []
     for i, prob_path in enumerate(prob_files):
         t_str = prob_path.name.split("_")[0]  # e.g. "t000"
-        out_path = out / f"{t_str}_foreground.tif"
-
-        if out_path.exists() and not overwrite:
-            frame = tifffile.imread(str(out_path))
-        else:
-            frame = compute_foreground_single(prob_path, cfg)
-            tifffile.imwrite(str(out_path), frame, compression="zlib")
-
+        frame = compute_foreground_single(prob_path, cfg)
         frames.append(frame)
-        yield (i + 1, total, f"{t_str}")
+        yield (i + 1, total, t_str)
 
-    # Write stacked volume (T, Z, Y, X)
     stacked = np.stack(frames, axis=0)
-    tifffile.imwrite(str(out / "foreground.tif"), stacked, compression="zlib")
+    tifffile.imwrite(str(out_path), stacked, compression="zlib")
     yield (total, total, "Done")
+
+
+# ── CLI entry point ──────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import argparse
+    import json
+    import sys
+
+    parser = argparse.ArgumentParser(
+        description="s02 — compute foreground masks from Cellpose prob maps",
+    )
+    parser.add_argument("--input-dir", required=True,
+                        help="Directory containing t*_prob.tif files")
+    parser.add_argument("--output-dir", required=True,
+                        help="Directory to write foreground TIFFs")
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Path to JSON file with ForegroundConfig fields (optional)",
+    )
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Overwrite existing per-timepoint files")
+    args = parser.parse_args()
+
+    cfg_dict: dict = {}
+    if args.config:
+        cfg_dict = json.loads(Path(args.config).read_text())
+    cfg = ForegroundConfig(**cfg_dict)
+
+    for done, total, label in run(args.input_dir, args.output_dir, cfg,
+                                   overwrite=args.overwrite):
+        print(f"[{done}/{total}] {label}", flush=True)
+
+    sys.exit(0)

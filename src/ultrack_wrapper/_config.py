@@ -25,6 +25,8 @@ class CellposeConfig(BaseModel):
     diameter: float = 17.0
     anisotropy: float = 1.0
     min_size: int = 500
+    use_gpu: bool = True
+    gamma: Optional[float] = None  # None = no correction; 1.0 = identity
 
 
 class ForegroundConfig(BaseModel):

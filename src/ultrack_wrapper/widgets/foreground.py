@@ -1,8 +1,9 @@
-"""Foreground detection tab — s02 interactive thresholding + post-processing."""
+"""Foreground detection panel — s02 interactive thresholding + post-processing."""
 
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +28,7 @@ from qtpy.QtWidgets import (
 from napari.qt.threading import thread_worker
 
 from ultrack_wrapper._config import ForegroundConfig
+from ultrack_wrapper.runners.terminal import launch_in_terminal
 from ultrack_wrapper.stages.s02_foreground import (
     apply_blur,
     apply_clahe,
@@ -44,12 +46,11 @@ class ForegroundWidget(QWidget):
         super().__init__()
         self.viewer = viewer
         self._worker = None
-        self._mag: np.ndarray | None = None  # cached magnitude volume
-        self._preview_layer = None  # napari Labels layer for preview
-        self._mag_layer = None  # napari Image layer for magnitude
-        self._clahe_layer = None  # napari Image layer for CLAHE output
+        self._mag: np.ndarray | None = None
+        self._preview_layer = None
+        self._mag_layer = None
+        self._clahe_layer = None
 
-        # Debounce timer for interactive updates
         self._update_timer = QTimer()
         self._update_timer.setSingleShot(True)
         self._update_timer.setInterval(200)
@@ -64,7 +65,7 @@ class ForegroundWidget(QWidget):
         self._input_edit = QLineEdit()
         self._input_edit.setPlaceholderText("/path/to/1a_cellpose_nucleus")
         row.addWidget(self._input_edit)
-        btn = QPushButton("Browse…")
+        btn = QPushButton("Browse\u2026")
         btn.clicked.connect(self._browse_input)
         row.addWidget(btn)
         layout.addLayout(row)
@@ -75,7 +76,7 @@ class ForegroundWidget(QWidget):
         self._output_edit = QLineEdit()
         self._output_edit.setPlaceholderText("/path/to/2_foreground")
         row.addWidget(self._output_edit)
-        btn = QPushButton("Browse…")
+        btn = QPushButton("Browse\u2026")
         btn.clicked.connect(self._browse_output)
         row.addWidget(btn)
         layout.addLayout(row)
@@ -93,7 +94,6 @@ class ForegroundWidget(QWidget):
         preproc_group = QGroupBox("Preprocessing")
         pre_layout = QVBoxLayout()
 
-        # Median filter
         row = QHBoxLayout()
         self._median_check = QCheckBox("Median filter, radius")
         self._median_check.toggled.connect(self._schedule_update)
@@ -105,7 +105,6 @@ class ForegroundWidget(QWidget):
         row.addWidget(self._median_radius_spin)
         pre_layout.addLayout(row)
 
-        # Gaussian filter
         row = QHBoxLayout()
         self._gaussian_check = QCheckBox("Gaussian filter, sigma")
         self._gaussian_check.toggled.connect(self._schedule_update)
@@ -119,7 +118,6 @@ class ForegroundWidget(QWidget):
         row.addWidget(self._gaussian_sigma_spin)
         pre_layout.addLayout(row)
 
-        # CLAHE
         self._clahe_check = QCheckBox("CLAHE")
         self._clahe_check.toggled.connect(self._schedule_update)
         pre_layout.addWidget(self._clahe_check)
@@ -153,7 +151,6 @@ class ForegroundWidget(QWidget):
         row.addWidget(self._method_combo)
         layout.addLayout(row)
 
-        # ── Threshold value (fixed method) ──────────────────────────────
         row = QHBoxLayout()
         row.addWidget(QLabel("Threshold"))
         self._thresh_spin = QDoubleSpinBox()
@@ -165,7 +162,6 @@ class ForegroundWidget(QWidget):
         row.addWidget(self._thresh_spin)
         layout.addLayout(row)
 
-        # ── Sigmoid parameters ──────────────────────────────────────────
         row = QHBoxLayout()
         row.addWidget(QLabel("Sigmoid center"))
         self._sigmoid_center_spin = QDoubleSpinBox()
@@ -183,14 +179,12 @@ class ForegroundWidget(QWidget):
         self._sigmoid_steepness_spin.setValue(3.0)
         self._sigmoid_steepness_spin.valueChanged.connect(self._schedule_update)
         row.addWidget(self._sigmoid_steepness_spin)
-        self._sigmoid_row = row
         layout.addLayout(row)
 
         # ── Post-processing group ────────────────────────────────────────
         postproc_group = QGroupBox("Post-processing")
         pp_layout = QVBoxLayout()
 
-        # Fill holes
         row = QHBoxLayout()
         self._fill_holes_check = QCheckBox("Fill holes, max size (0=all)")
         self._fill_holes_check.setChecked(True)
@@ -204,7 +198,6 @@ class ForegroundWidget(QWidget):
         row.addWidget(self._fill_holes_max_spin)
         pp_layout.addLayout(row)
 
-        # Morphological operation
         row = QHBoxLayout()
         row.addWidget(QLabel("Morphology"))
         self._morpho_combo = QComboBox()
@@ -219,7 +212,6 @@ class ForegroundWidget(QWidget):
         row.addWidget(self._morpho_radius_spin)
         pp_layout.addLayout(row)
 
-        # Remove small objects
         row = QHBoxLayout()
         self._remove_small_check = QCheckBox("Remove small objects, min size")
         self._remove_small_check.setChecked(True)
@@ -233,7 +225,6 @@ class ForegroundWidget(QWidget):
         row.addWidget(self._remove_small_spin)
         pp_layout.addLayout(row)
 
-        # Area filter
         row = QHBoxLayout()
         self._area_filter_check = QCheckBox("Area filter")
         self._area_filter_check.toggled.connect(self._schedule_update)
@@ -254,7 +245,6 @@ class ForegroundWidget(QWidget):
         row.addWidget(self._area_max_spin)
         pp_layout.addLayout(row)
 
-        # Distance filter (break thin bridges, keep round regions)
         row = QHBoxLayout()
         self._distance_filter_check = QCheckBox("Distance filter, min radius")
         self._distance_filter_check.toggled.connect(self._schedule_update)
@@ -271,37 +261,41 @@ class ForegroundWidget(QWidget):
         postproc_group.setLayout(pp_layout)
         layout.addWidget(postproc_group)
 
-        # ── Action buttons ───────────────────────────────────────────────
+        # ── Preview buttons ──────────────────────────────────────────────
         row = QHBoxLayout()
         self._preview_btn = QPushButton("Preview")
         self._preview_btn.clicked.connect(self._on_preview)
         row.addWidget(self._preview_btn)
-
         self._edit_btn = QPushButton("Edit Mask")
         self._edit_btn.setEnabled(False)
         self._edit_btn.clicked.connect(self._on_edit_mask)
         row.addWidget(self._edit_btn)
         layout.addLayout(row)
 
-        self._run_btn = QPushButton("Run All")
+        # ── Run buttons ──────────────────────────────────────────────────
+        row = QHBoxLayout()
+        self._run_btn = QPushButton("Run Foreground")
         self._run_btn.clicked.connect(self._on_run)
-        layout.addWidget(self._run_btn)
+        row.addWidget(self._run_btn)
+        self._run_terminal_btn = QPushButton("Run in Terminal")
+        self._run_terminal_btn.clicked.connect(self._on_run_terminal)
+        row.addWidget(self._run_terminal_btn)
+        layout.addLayout(row)
 
-        # ── Overwrite ────────────────────────────────────────────────────
+        # ── Overwrite + Load results ─────────────────────────────────────
         self._overwrite_check = QCheckBox("Overwrite existing files")
         layout.addWidget(self._overwrite_check)
 
-        # ── Load results ─────────────────────────────────────────────────
         self._load_results_btn = QPushButton("Load Results")
         self._load_results_btn.clicked.connect(self._on_load_results)
         layout.addWidget(self._load_results_btn)
 
         # ── Save / Load parameters ───────────────────────────────────────
         row = QHBoxLayout()
-        save_btn = QPushButton("Save Parameters…")
+        save_btn = QPushButton("Save Parameters\u2026")
         save_btn.clicked.connect(self._on_save_params)
         row.addWidget(save_btn)
-        load_btn = QPushButton("Load Parameters…")
+        load_btn = QPushButton("Load Parameters\u2026")
         load_btn.clicked.connect(self._on_load_params)
         row.addWidget(load_btn)
         layout.addLayout(row)
@@ -314,7 +308,6 @@ class ForegroundWidget(QWidget):
         self._status_label = QLabel("")
         layout.addWidget(self._status_label)
 
-        # Initial enable state for method-specific controls
         self._sigmoid_center_spin.setEnabled(False)
         self._sigmoid_steepness_spin.setEnabled(False)
 
@@ -382,7 +375,6 @@ class ForegroundWidget(QWidget):
     # ── Interactive preview ──────────────────────────────────────────────
 
     def _schedule_update(self) -> None:
-        """Debounced re-threshold when a parameter changes."""
         if self._mag is not None:
             self._update_timer.start()
 
@@ -390,36 +382,30 @@ class ForegroundWidget(QWidget):
         prob_path = self._get_prob_path_for_preview()
         if prob_path is None:
             return
-
-        self._status_label.setText(f"Loading {prob_path.name}…")
+        self._status_label.setText(f"Loading {prob_path.name}\u2026")
         self._mag = load_prob_map(prob_path)
-
-        # Show probability map as an image layer
         if self._mag_layer is None or self._mag_layer not in self.viewer.layers:
             self._mag_layer = self.viewer.add_image(
                 self._mag, name="cell probability", colormap="inferno"
             )
         else:
             self._mag_layer.data = self._mag
-
         self._update_preview()
         self._edit_btn.setEnabled(True)
         self._status_label.setText(f"Preview: {prob_path.name}")
 
     def _update_preview(self) -> None:
-        """Recompute foreground from cached magnitude and update the layer."""
         if self._mag is None:
             return
         cfg = self._build_config()
-
-        # Show preprocessed magnitude if any preprocessing is enabled
         has_preproc = cfg.median_filter or cfg.gaussian_filter or cfg.clahe
         if has_preproc:
             preproc_mag = apply_blur(self._mag, cfg)
             preproc_mag = apply_clahe(preproc_mag, cfg)
             if self._clahe_layer is None or self._clahe_layer not in self.viewer.layers:
                 self._clahe_layer = self.viewer.add_image(
-                    preproc_mag, name="preprocessed magnitude", colormap="magma", visible=True,
+                    preproc_mag, name="preprocessed magnitude",
+                    colormap="magma", visible=True,
                 )
             else:
                 self._clahe_layer.data = preproc_mag
@@ -428,7 +414,6 @@ class ForegroundWidget(QWidget):
             self._clahe_layer = None
 
         mask = compute_foreground_from_mag(self._mag, cfg)
-
         if self._preview_layer is None or self._preview_layer not in self.viewer.layers:
             self._preview_layer = self.viewer.add_labels(
                 mask.astype(np.int32), name="foreground preview"
@@ -437,16 +422,14 @@ class ForegroundWidget(QWidget):
             self._preview_layer.data = mask.astype(np.int32)
 
     def _on_edit_mask(self) -> None:
-        """Enable paint/erase on the preview labels layer."""
         if self._preview_layer is not None and self._preview_layer in self.viewer.layers:
             self.viewer.layers.selection.active = self._preview_layer
             self._preview_layer.mode = "paint"
             self._status_label.setText(
-                "Editing mask — use paint (1) / erase (0) tools. "
-                "Changes are local to this preview."
+                "Editing mask — use paint (1) / erase (0) tools."
             )
 
-    # ── Run all ──────────────────────────────────────────────────────────
+    # ── Run foreground ───────────────────────────────────────────────────
 
     def _on_run(self) -> None:
         input_dir = self._input_edit.text().strip()
@@ -454,14 +437,12 @@ class ForegroundWidget(QWidget):
         if not input_dir or not output_dir:
             self._status_label.setText("Set both input and output directories.")
             return
-
         cfg = self._build_config()
         overwrite = self._overwrite_check.isChecked()
-
         self._run_btn.setEnabled(False)
         self._progress.setVisible(True)
         self._progress.setValue(0)
-        self._status_label.setText("Starting…")
+        self._status_label.setText("Starting\u2026")
 
         @thread_worker(
             connect={
@@ -476,6 +457,29 @@ class ForegroundWidget(QWidget):
 
         self._worker = _work()
 
+    def _on_run_terminal(self) -> None:
+        input_dir = self._input_edit.text().strip()
+        output_dir = self._output_edit.text().strip()
+        if not input_dir or not output_dir:
+            self._status_label.setText("Set both input and output directories.")
+            return
+        cfg = self._build_config()
+        cfg_path = Path(tempfile.mktemp(suffix="_fg_config.json"))
+        cfg_path.write_text(json.dumps(cfg.model_dump(), indent=2))
+        overwrite_flag = "--overwrite" if self._overwrite_check.isChecked() else ""
+        cmd = (
+            f"python -m ultrack_wrapper.stages.s02_foreground"
+            f" --input-dir \"{input_dir}\""
+            f" --output-dir \"{output_dir}\""
+            f" --config \"{cfg_path}\""
+            f" {overwrite_flag}"
+        ).strip()
+        try:
+            launch_in_terminal(cmd)
+            self._status_label.setText("Launched foreground stage in terminal.")
+        except Exception as e:
+            self._status_label.setText(f"Terminal launch error: {e}")
+
     def _on_progress(self, update: tuple) -> None:
         done, total, label = update
         self._progress.setMaximum(max(total, 1))
@@ -485,9 +489,8 @@ class ForegroundWidget(QWidget):
     def _on_finished(self) -> None:
         self._run_btn.setEnabled(True)
         self._progress.setVisible(False)
-        self._status_label.setText("Done — foreground.tif written.")
+        self._status_label.setText("Done \u2014 foreground.tif written.")
         self._worker = None
-        # Auto-load results into viewer
         self._load_foreground_stack()
 
     def _on_error(self, exc: Exception) -> None:
@@ -499,7 +502,6 @@ class ForegroundWidget(QWidget):
     # ── Load results ────────────────────────────────────────────────────
 
     def _load_foreground_stack(self) -> None:
-        """Load foreground.tif from the output directory as a TZYX hyperstack."""
         output_dir = self._output_edit.text().strip()
         if not output_dir:
             return
@@ -508,10 +510,7 @@ class ForegroundWidget(QWidget):
             self._status_label.setText("No foreground.tif found in output directory.")
             return
         stack = tifffile.imread(str(fg_path))
-        self.viewer.add_labels(
-            stack.astype(np.int32),
-            name="foreground (all timepoints)",
-        )
+        self.viewer.add_labels(stack.astype(np.int32), name="foreground (all timepoints)")
         self._status_label.setText(f"Loaded foreground stack: {stack.shape}")
 
     def _on_load_results(self) -> None:
@@ -541,8 +540,6 @@ class ForegroundWidget(QWidget):
         self._status_label.setText(f"Parameters loaded from {Path(path).name}")
 
     def _apply_config(self, cfg: ForegroundConfig) -> None:
-        """Set all widget controls from a ForegroundConfig."""
-        # Preprocessing
         self._median_check.setChecked(cfg.median_filter)
         self._median_radius_spin.setValue(cfg.median_radius)
         self._gaussian_check.setChecked(cfg.gaussian_filter)
@@ -550,12 +547,10 @@ class ForegroundWidget(QWidget):
         self._clahe_check.setChecked(cfg.clahe)
         self._clahe_clip_spin.setValue(cfg.clahe_clip_limit)
         self._clahe_kernel_spin.setValue(cfg.clahe_kernel_size)
-        # Threshold
         self._method_combo.setCurrentText(cfg.method)
         self._thresh_spin.setValue(cfg.threshold)
         self._sigmoid_center_spin.setValue(cfg.sigmoid_center)
         self._sigmoid_steepness_spin.setValue(cfg.sigmoid_steepness)
-        # Post-processing
         self._fill_holes_check.setChecked(cfg.fill_holes)
         self._fill_holes_max_spin.setValue(cfg.fill_holes_max_size)
         self._morpho_combo.setCurrentText(cfg.morpho_op)

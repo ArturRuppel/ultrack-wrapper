@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from qtpy.QtWidgets import QTabWidget, QWidget, QVBoxLayout, QLabel
+from qtpy.QtWidgets import QLabel, QTabWidget, QVBoxLayout, QWidget
 
 from ultrack_wrapper._widget_data_prep import DataPrepWidget
-from ultrack_wrapper._widget_foreground import ForegroundWidget
-from ultrack_wrapper._widget_contours import ContoursWidget
-from ultrack_wrapper._widget_tracking import TrackingWidget
+from ultrack_wrapper.widgets import CellposeWidget, UltrackAnalysisWidget
 
 
 class UltrackWidget(QTabWidget):
@@ -18,10 +16,8 @@ class UltrackWidget(QTabWidget):
         self.viewer = napari_viewer
 
         self.addTab(DataPrepWidget(napari_viewer), "Data Prep")
-        self.addTab(self._make_placeholder("Cellpose"), "Cellpose")
-        self.addTab(ForegroundWidget(napari_viewer), "Foreground")
-        self.addTab(ContoursWidget(napari_viewer), "Contours")
-        self.addTab(TrackingWidget(napari_viewer), "Tracking")
+        self.addTab(CellposeWidget(napari_viewer), "Cellpose")
+        self.addTab(UltrackAnalysisWidget(napari_viewer), "Analysis")
         self.addTab(self._make_placeholder("Post-processing"), "Post-proc")
 
     @staticmethod

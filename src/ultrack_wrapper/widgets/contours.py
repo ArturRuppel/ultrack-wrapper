@@ -1,16 +1,17 @@
-"""Contour map tab — s02b interactive edge/boundary map for Ultrack."""
+"""Contour map panel — s02b interactive edge/boundary map for Ultrack."""
 
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
 
 import numpy as np
 import tifffile
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtWidgets import (
-    QComboBox,
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QHBoxLayout,
@@ -26,6 +27,7 @@ from qtpy.QtWidgets import (
 from napari.qt.threading import thread_worker
 
 from ultrack_wrapper._config import ContoursConfig
+from ultrack_wrapper.runners.terminal import launch_in_terminal
 from ultrack_wrapper.stages.s02b_contours import (
     compute_contours_from_array,
     discover_prob_files,
@@ -53,7 +55,7 @@ class ContoursWidget(QWidget):
         layout = QVBoxLayout()
         layout.setAlignment(Qt.AlignTop)
 
-        # ── Cellpose output directory (prob maps) ────────────────────────
+        # ── Cellpose output directory ────────────────────────────────────
         layout.addWidget(QLabel("Cellpose output directory (prob maps)"))
         row = QHBoxLayout()
         self._input_edit = QLineEdit()
@@ -144,17 +146,24 @@ class ContoursWidget(QWidget):
         row.addWidget(self._fg_thresh_spin)
         layout.addLayout(row)
 
-        # ── Action buttons ───────────────────────────────────────────────
+        # ── Preview button ───────────────────────────────────────────────
         row = QHBoxLayout()
         self._preview_btn = QPushButton("Preview")
         self._preview_btn.clicked.connect(self._on_preview)
         row.addWidget(self._preview_btn)
         layout.addLayout(row)
 
-        self._run_btn = QPushButton("Run All")
+        # ── Run buttons ──────────────────────────────────────────────────
+        row = QHBoxLayout()
+        self._run_btn = QPushButton("Run Contours")
         self._run_btn.clicked.connect(self._on_run)
-        layout.addWidget(self._run_btn)
+        row.addWidget(self._run_btn)
+        self._run_terminal_btn = QPushButton("Run in Terminal")
+        self._run_terminal_btn.clicked.connect(self._on_run_terminal)
+        row.addWidget(self._run_terminal_btn)
+        layout.addLayout(row)
 
+        # ── Overwrite + Load results ─────────────────────────────────────
         self._overwrite_check = QCheckBox("Overwrite existing files")
         layout.addWidget(self._overwrite_check)
 
@@ -180,9 +189,7 @@ class ContoursWidget(QWidget):
         self._status_label = QLabel("")
         layout.addWidget(self._status_label)
 
-        # Initial enable state
         self._on_method_changed(self._method_combo.currentText())
-
         self.setLayout(layout)
 
     # ── Helpers ──────────────────────────────────────────────────────────
@@ -239,7 +246,6 @@ class ContoursWidget(QWidget):
         if not input_dir:
             self._status_label.setText("Set cellpose output directory first.")
             return
-
         prob_files = discover_prob_files(input_dir)
         idx = self._tp_spin.value()
         if not prob_files:
@@ -248,7 +254,6 @@ class ContoursWidget(QWidget):
         if idx >= len(prob_files):
             self._status_label.setText(f"Only {len(prob_files)} timepoints available.")
             return
-
         self._status_label.setText(f"Loading {prob_files[idx].name}\u2026")
         self._prob = load_prob_map(prob_files[idx])
         self._update_preview()
@@ -259,16 +264,12 @@ class ContoursWidget(QWidget):
             return
         cfg = self._build_config()
         contours, fg = compute_contours_from_array(self._prob, cfg)
-
-        # Show contour map
         if self._contours_layer is None or self._contours_layer not in self.viewer.layers:
             self._contours_layer = self.viewer.add_image(
                 contours, name="contours preview", colormap="hot",
             )
         else:
             self._contours_layer.data = contours
-
-        # Show sigmoid foreground
         if self._fg_layer is None or self._fg_layer not in self.viewer.layers:
             self._fg_layer = self.viewer.add_image(
                 fg, name="sigmoid foreground", colormap="green", visible=False,
@@ -276,7 +277,7 @@ class ContoursWidget(QWidget):
         else:
             self._fg_layer.data = fg
 
-    # ── Run all ──────────────────────────────────────────────────────────
+    # ── Run contours ─────────────────────────────────────────────────────
 
     def _on_run(self) -> None:
         input_dir = self._input_edit.text().strip()
@@ -284,10 +285,8 @@ class ContoursWidget(QWidget):
         if not input_dir or not output_dir:
             self._status_label.setText("Set both input and output directories.")
             return
-
         cfg = self._build_config()
         overwrite = self._overwrite_check.isChecked()
-
         self._run_btn.setEnabled(False)
         self._progress.setVisible(True)
         self._progress.setValue(0)
@@ -305,6 +304,29 @@ class ContoursWidget(QWidget):
                 yield update
 
         self._worker = _work()
+
+    def _on_run_terminal(self) -> None:
+        input_dir = self._input_edit.text().strip()
+        output_dir = self._output_edit.text().strip()
+        if not input_dir or not output_dir:
+            self._status_label.setText("Set both input and output directories.")
+            return
+        cfg = self._build_config()
+        cfg_path = Path(tempfile.mktemp(suffix="_contours_config.json"))
+        cfg_path.write_text(json.dumps(cfg.model_dump(), indent=2))
+        overwrite_flag = "--overwrite" if self._overwrite_check.isChecked() else ""
+        cmd = (
+            f"python -m ultrack_wrapper.stages.s02b_contours"
+            f" --input-dir \"{input_dir}\""
+            f" --output-dir \"{output_dir}\""
+            f" --config \"{cfg_path}\""
+            f" {overwrite_flag}"
+        ).strip()
+        try:
+            launch_in_terminal(cmd)
+            self._status_label.setText("Launched contours stage in terminal.")
+        except Exception as e:
+            self._status_label.setText(f"Terminal launch error: {e}")
 
     def _on_progress(self, update: tuple) -> None:
         done, total, label = update
@@ -336,9 +358,7 @@ class ContoursWidget(QWidget):
             self._status_label.setText("No contours.tif found in output directory.")
             return
         stack = tifffile.imread(str(path))
-        self.viewer.add_image(
-            stack, name="contours (all timepoints)", colormap="hot",
-        )
+        self.viewer.add_image(stack, name="contours (all timepoints)", colormap="hot")
         self._status_label.setText(f"Loaded contours stack: {stack.shape}")
 
     def _on_load_results(self) -> None:
@@ -348,7 +368,7 @@ class ContoursWidget(QWidget):
 
     def _on_save_params(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save parameters", "", "JSON files (*.json)",
+            self, "Save parameters", "", "JSON files (*.json)"
         )
         if not path:
             return
@@ -358,7 +378,7 @@ class ContoursWidget(QWidget):
 
     def _on_load_params(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load parameters", "", "JSON files (*.json)",
+            self, "Load parameters", "", "JSON files (*.json)"
         )
         if not path:
             return
