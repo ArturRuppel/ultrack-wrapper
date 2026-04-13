@@ -460,14 +460,94 @@ class UltrackAnalysisWidget(QWidget):
         threshold_count = len(thresholds)
         self._cp_ct_status.setText(f"Preview: 1 frame × {threshold_count} threshold(s) averaged")
 
+    def _cp_ct_run_sweep_and_average(self, inp: str, out: str, overwrite: bool):
+        """Generator that sweeps cellprob thresholds and averages results."""
+        from pathlib import Path
+
+        dp_files = discover_dp_files(inp)
+        prob_files = discover_prob_files(inp)
+
+        if not dp_files or not prob_files or len(dp_files) != len(prob_files):
+            yield (0, 0, "No valid dP/prob file pairs found")
+            return
+
+        # Generate cellprob thresholds from min/max/step
+        min_thresh = self._cp_ct_cellprob_min.value()
+        max_thresh = self._cp_ct_cellprob_max.value()
+        step = self._cp_ct_cellprob_step.value()
+
+        if step <= 0:
+            yield (0, 0, "Error: step size must be positive")
+            return
+
+        if min_thresh == max_thresh:
+            thresholds = [min_thresh]
+        else:
+            thresholds = list(np.arange(min_thresh, max_thresh + step / 2, step))
+
+        if not thresholds:
+            yield (0, 0, "Error: no cellprob thresholds generated")
+            return
+
+        total_frames = len(dp_files)
+        out_path = Path(out)
+        out_path.mkdir(parents=True, exist_ok=True)
+
+        fg_path = out_path / "foreground.tif"
+        ct_path = out_path / "contours.tif"
+
+        if not overwrite and fg_path.exists() and ct_path.exists():
+            yield (0, 1, "foreground.tif and contours.tif already exist, skipping")
+            return
+
+        cfg = self._cp_ct_build_config()
+        fg_frames = []
+        ct_frames = []
+
+        yield (0, total_frames, f"Processing {total_frames} frame(s) with {len(thresholds)} threshold(s)")
+
+        for frame_idx, (dp_file, prob_file) in enumerate(zip(dp_files, prob_files)):
+            try:
+                dp = tifffile.imread(str(dp_file)).astype(np.float32)
+                prob = tifffile.imread(str(prob_file)).astype(np.float32)
+
+                fg_list = []
+                ct_list = []
+
+                for thresh in thresholds:
+                    cfg.cellprob_threshold = thresh
+                    _, fg, ct = compute_cp_contours_single(dp, prob, cfg)
+                    fg_list.append(fg)
+                    ct_list.append(ct)
+
+                # Average across thresholds
+                fg_avg = np.mean(fg_list, axis=0).astype(np.float32)
+                ct_avg = np.mean(ct_list, axis=0).astype(np.float32)
+
+                fg_frames.append(fg_avg)
+                ct_frames.append(ct_avg)
+
+                t_str = dp_file.name.split("_")[0]
+                yield (frame_idx + 1, total_frames, t_str)
+            except Exception as e:
+                yield (frame_idx + 1, total_frames, f"Error {frame_idx}: {e}")
+                raise
+
+        # Write stacks
+        fg_stack = np.stack(fg_frames, axis=0)
+        ct_stack = np.stack(ct_frames, axis=0)
+        tifffile.imwrite(str(fg_path), fg_stack, compression="zlib")
+        tifffile.imwrite(str(ct_path), ct_stack, compression="zlib")
+
+        yield (total_frames, total_frames, "Done")
+
     def _cp_ct_on_run(self) -> None:
-        """Run cellpose contours stage in background."""
+        """Run cellpose contours stage with threshold sweep and averaging."""
         paths = self._get_paths()
         if paths is None:
             self._cp_ct_status.setText("Set input and output directories first.")
             return
         inp, out = paths
-        cfg = self._cp_ct_build_config()
         overwrite = self._cp_ct_overwrite_chk.isChecked()
         self._cp_ct_run_btn.setEnabled(False)
         self._cp_ct_cancel_btn.setEnabled(True)
@@ -482,7 +562,7 @@ class UltrackAnalysisWidget(QWidget):
             }
         )
         def _work():
-            for u in run_s02c(inp, out, cfg, overwrite=overwrite):
+            for u in self._cp_ct_run_sweep_and_average(inp, out, overwrite):
                 yield u
 
         self._cp_ct_worker = _work()
