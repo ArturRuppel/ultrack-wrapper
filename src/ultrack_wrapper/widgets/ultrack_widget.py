@@ -1,4 +1,4 @@
-"""Unified scrollable analysis widget: Foreground → Contours → Tracking."""
+"""Unified scrollable analysis widget: Cellpose Contours → Tracking."""
 
 from __future__ import annotations
 
@@ -32,19 +32,13 @@ from qtpy.QtWidgets import (
 
 from napari.qt.threading import thread_worker
 
-from ultrack_wrapper._config import ContoursConfig, ForegroundConfig, TrackingConfig
+from ultrack_wrapper._config import CellposeContoursConfig, TrackingConfig
 from ultrack_wrapper.runners.terminal import launch_in_terminal
-from ultrack_wrapper.stages.s02_foreground import (
-    apply_blur,
-    apply_clahe,
-    compute_foreground_from_mag,
+from ultrack_wrapper.stages.s02c_cellpose_contours import (
+    compute_single_from_arrays as compute_cp_contours_single,
+    discover_dp_files,
     discover_prob_files,
-    load_prob_map,
-    run as run_s02,
-)
-from ultrack_wrapper.stages.s02b_contours import (
-    compute_contours_from_array,
-    run as run_s02b,
+    run as run_s02c,
 )
 from ultrack_wrapper.stages.s03_tracking import (
     export_ctc,
@@ -63,12 +57,12 @@ from ultrack_wrapper.stages.s03_tracking import (
 
 
 class UltrackAnalysisWidget(QWidget):
-    """Single scrollable panel for Foreground, Contours, and Tracking stages.
+    """Single scrollable panel for Cellpose Contours and Tracking stages.
 
     All paths are derived from two shared inputs at the top:
-    - **Input directory** — contains ``t*_prob.tif`` Cellpose output files.
-    - **Output directory** — base folder; stage sub-dirs are created automatically:
-      ``2_foreground/``, ``2b_contours/``, ``3_tracking/``.
+    - **Input directory** — contains ``t*_prob.tif`` and ``t*_dp.tif`` Cellpose output files.
+    - **Output directory** — base folder; outputs are written directly:
+      ``foreground.tif``, ``contours.tif``, ``tracks.csv``, ``tracked_labels.tif``, ``data.db``.
     """
 
     def __init__(self, viewer: "napari.Viewer") -> None:
@@ -76,8 +70,7 @@ class UltrackAnalysisWidget(QWidget):
         self.viewer = viewer
 
         # Background workers
-        self._fg_worker = None
-        self._ct_worker = None
+        self._cp_ct_worker = None
         self._tr_worker = None
         self._seg_worker = None
         self._lnk_worker = None
@@ -85,26 +78,21 @@ class UltrackAnalysisWidget(QWidget):
         self._all_worker = None
 
         # Cached preview data
-        self._fg_mag: np.ndarray | None = None
-        self._ct_prob: np.ndarray | None = None
+        self._cp_ct_dp: np.ndarray | None = None
+        self._cp_ct_prob: np.ndarray | None = None
+        self._cp_ct_dp_stack: np.ndarray | None = None
+        self._cp_ct_prob_stack: np.ndarray | None = None
 
         # Napari layer handles (preview)
-        self._fg_mag_layer = None
-        self._fg_preproc_layer = None
-        self._fg_preview_layer = None
-        self._ct_contours_layer = None
-        self._ct_fg_layer = None
+        self._cp_ct_labels_layer = None
+        self._cp_ct_contours_layer = None
+        self._cp_ct_fg_layer = None
 
         # Debounce timers
-        self._fg_timer = QTimer()
-        self._fg_timer.setSingleShot(True)
-        self._fg_timer.setInterval(200)
-        self._fg_timer.timeout.connect(self._fg_update_preview)
-
-        self._ct_timer = QTimer()
-        self._ct_timer.setSingleShot(True)
-        self._ct_timer.setInterval(200)
-        self._ct_timer.timeout.connect(self._ct_update_preview)
+        self._cp_ct_timer = QTimer()
+        self._cp_ct_timer.setSingleShot(True)
+        self._cp_ct_timer.setInterval(400)  # compute_masks is heavier
+        self._cp_ct_timer.timeout.connect(self._cp_ct_update_preview)
 
         # ── Outer scroll area ────────────────────────────────────────────
         scroll = QScrollArea()
@@ -156,14 +144,13 @@ class UltrackAnalysisWidget(QWidget):
         lay.addLayout(row)
 
         # ── Build stage sections ─────────────────────────────────────────
-        lay.addWidget(self._build_foreground_section())
-        lay.addWidget(self._build_contours_section())
+        lay.addWidget(self._build_cp_contours_section())
         lay.addWidget(self._build_tracking_section())
 
         # ── Run All ──────────────────────────────────────────────────────
         row = QHBoxLayout()
         self._run_all_btn = QPushButton(
-            "Run All  (Foreground \u2192 Contours \u2192 Tracking)"
+            "Run All  (Cellpose Contours \u2192 Tracking)"
         )
         self._run_all_btn.clicked.connect(self._on_run_all)
         row.addWidget(self._run_all_btn)
@@ -203,769 +190,429 @@ class UltrackAnalysisWidget(QWidget):
         return inp, out
 
     # ══════════════════════════════════════════════════════════════════════
-    # FOREGROUND section
+    # CELLPOSE CONTOURS section (s02c)
     # ══════════════════════════════════════════════════════════════════════
 
-    def _build_foreground_section(self) -> QGroupBox:
-        grp = QGroupBox("Foreground")
+    def _build_cp_contours_section(self) -> QGroupBox:
+        """Build the Cellpose-native contours section (s02c)."""
+        grp = QGroupBox("Contours (Cellpose)")
         lay = QVBoxLayout()
 
-        # Preview timepoint
+        # Preview timepoint range
         row = QHBoxLayout()
-        row.addWidget(QLabel("Preview timepoint"))
-        self._fg_tp_spin = QSpinBox()
-        self._fg_tp_spin.setRange(0, 9999)
-        self._fg_tp_spin.setToolTip("Index of the timepoint to use for live preview")
-        row.addWidget(self._fg_tp_spin)
+        row.addWidget(QLabel("Preview timepoint range"))
+        self._cp_ct_tp_start = QSpinBox()
+        self._cp_ct_tp_start.setRange(0, 9999)
+        self._cp_ct_tp_start.setValue(0)
+        self._cp_ct_tp_start.setToolTip("Start timepoint index")
+        row.addWidget(self._cp_ct_tp_start)
+        row.addWidget(QLabel("to"))
+        self._cp_ct_tp_end = QSpinBox()
+        self._cp_ct_tp_end.setRange(0, 9999)
+        self._cp_ct_tp_end.setValue(0)
+        self._cp_ct_tp_end.setToolTip("End timepoint index (inclusive)")
+        row.addWidget(self._cp_ct_tp_end)
+        row.addWidget(QLabel("step"))
+        self._cp_ct_tp_step = QSpinBox()
+        self._cp_ct_tp_step.setRange(1, 9999)
+        self._cp_ct_tp_step.setValue(1)
+        self._cp_ct_tp_step.setToolTip("Step size for timepoint range")
+        row.addWidget(self._cp_ct_tp_step)
         lay.addLayout(row)
 
-        # Preprocessing
-        pre = QGroupBox("Preprocessing")
-        pre_lay = QVBoxLayout()
-
+        # Flow threshold
         row = QHBoxLayout()
-        self._fg_median_chk = QCheckBox("Median filter, radius")
-        self._fg_median_chk.setToolTip("Apply a median filter to reduce salt-and-pepper noise before thresholding")
-        self._fg_median_chk.toggled.connect(self._fg_schedule)
-        row.addWidget(self._fg_median_chk)
-        self._fg_median_spin = QSpinBox()
-        self._fg_median_spin.setRange(1, 10)
-        self._fg_median_spin.setValue(2)
-        self._fg_median_spin.setToolTip("Kernel radius (pixels) for the median filter")
-        self._fg_median_spin.valueChanged.connect(self._fg_schedule)
-        row.addWidget(self._fg_median_spin)
-        pre_lay.addLayout(row)
-
-        row = QHBoxLayout()
-        self._fg_gauss_chk = QCheckBox("Gaussian filter, sigma")
-        self._fg_gauss_chk.setToolTip("Apply a Gaussian blur to smooth the probability map before thresholding")
-        self._fg_gauss_chk.toggled.connect(self._fg_schedule)
-        row.addWidget(self._fg_gauss_chk)
-        self._fg_gauss_spin = QDoubleSpinBox()
-        self._fg_gauss_spin.setRange(0.1, 20.0)
-        self._fg_gauss_spin.setSingleStep(0.5)
-        self._fg_gauss_spin.setDecimals(1)
-        self._fg_gauss_spin.setValue(1.0)
-        self._fg_gauss_spin.setToolTip("Standard deviation (pixels) of the Gaussian kernel")
-        self._fg_gauss_spin.valueChanged.connect(self._fg_schedule)
-        row.addWidget(self._fg_gauss_spin)
-        pre_lay.addLayout(row)
-
-        self._fg_clahe_chk = QCheckBox("CLAHE")
-        self._fg_clahe_chk.setToolTip("Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to enhance local contrast")
-        self._fg_clahe_chk.toggled.connect(self._fg_schedule)
-        pre_lay.addWidget(self._fg_clahe_chk)
-
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Clip limit"))
-        self._fg_clahe_clip = QDoubleSpinBox()
-        self._fg_clahe_clip.setRange(0.001, 1.0)
-        self._fg_clahe_clip.setSingleStep(0.005)
-        self._fg_clahe_clip.setDecimals(3)
-        self._fg_clahe_clip.setValue(0.01)
-        self._fg_clahe_clip.setToolTip("CLAHE clip limit — controls contrast amplification; smaller values give less amplification")
-        self._fg_clahe_clip.valueChanged.connect(self._fg_schedule)
-        row.addWidget(self._fg_clahe_clip)
-        row.addWidget(QLabel("Kernel size (0=auto)"))
-        self._fg_clahe_kernel = QSpinBox()
-        self._fg_clahe_kernel.setRange(0, 512)
-        self._fg_clahe_kernel.setToolTip("Tile size for CLAHE. 0 = auto (1/8 of the image size)")
-        self._fg_clahe_kernel.valueChanged.connect(self._fg_schedule)
-        row.addWidget(self._fg_clahe_kernel)
-        pre_lay.addLayout(row)
-
-        pre.setLayout(pre_lay)
-        lay.addWidget(pre)
-
-        # Threshold method
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Threshold method"))
-        self._fg_method_combo = QComboBox()
-        self._fg_method_combo.addItems(["fixed", "otsu", "triangle", "sigmoid"])
-        self._fg_method_combo.setToolTip("Thresholding algorithm: \"fixed\" uses the explicit value; \"otsu\"/\"triangle\" are automatic; \"sigmoid\" uses a soft curve")
-        self._fg_method_combo.currentTextChanged.connect(self._fg_on_method_changed)
-        row.addWidget(self._fg_method_combo)
-        lay.addLayout(row)
-
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Threshold"))
-        self._fg_thresh_spin = QDoubleSpinBox()
-        self._fg_thresh_spin.setRange(0.0, 50.0)
-        self._fg_thresh_spin.setSingleStep(0.1)
-        self._fg_thresh_spin.setDecimals(2)
-        self._fg_thresh_spin.setValue(1.0)
-        self._fg_thresh_spin.setToolTip("Intensity threshold for the \"fixed\" method. Pixels above this are foreground")
-        self._fg_thresh_spin.valueChanged.connect(self._fg_schedule)
-        row.addWidget(self._fg_thresh_spin)
-        lay.addLayout(row)
-
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Sigmoid center"))
-        self._fg_sig_center = QDoubleSpinBox()
-        self._fg_sig_center.setRange(0.0, 50.0)
-        self._fg_sig_center.setSingleStep(0.1)
-        self._fg_sig_center.setDecimals(2)
-        self._fg_sig_center.setValue(1.0)
-        self._fg_sig_center.setToolTip("Midpoint intensity of the sigmoid curve (only active when method = \"sigmoid\")")
-        self._fg_sig_center.valueChanged.connect(self._fg_schedule)
-        row.addWidget(self._fg_sig_center)
-        row.addWidget(QLabel("steepness"))
-        self._fg_sig_steep = QDoubleSpinBox()
-        self._fg_sig_steep.setRange(0.1, 50.0)
-        self._fg_sig_steep.setSingleStep(0.5)
-        self._fg_sig_steep.setDecimals(1)
-        self._fg_sig_steep.setValue(3.0)
-        self._fg_sig_steep.setToolTip("Slope of the sigmoid transition; higher = sharper boundary (only active when method = \"sigmoid\")")
-        self._fg_sig_steep.valueChanged.connect(self._fg_schedule)
-        row.addWidget(self._fg_sig_steep)
-        lay.addLayout(row)
-
-        # Post-processing
-        post = QGroupBox("Post-processing")
-        pp = QVBoxLayout()
-
-        row = QHBoxLayout()
-        self._fg_fill_chk = QCheckBox("Fill holes, max size (0=all)")
-        self._fg_fill_chk.setChecked(True)
-        self._fg_fill_chk.setToolTip("Fill enclosed holes in the foreground mask")
-        self._fg_fill_chk.toggled.connect(self._fg_schedule)
-        row.addWidget(self._fg_fill_chk)
-        self._fg_fill_spin = QSpinBox()
-        self._fg_fill_spin.setRange(0, 10_000_000)
-        self._fg_fill_spin.setSingleStep(100)
-        self._fg_fill_spin.setToolTip("Maximum hole area (pixels) to fill. 0 = fill all holes")
-        self._fg_fill_spin.valueChanged.connect(self._fg_schedule)
-        row.addWidget(self._fg_fill_spin)
-        pp.addLayout(row)
-
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Morphology"))
-        self._fg_morpho_combo = QComboBox()
-        self._fg_morpho_combo.addItems(["none", "opening", "closing"])
-        self._fg_morpho_combo.setToolTip("Morphological operation after thresholding: \"opening\" removes small protrusions, \"closing\" fills small gaps")
-        self._fg_morpho_combo.currentTextChanged.connect(self._fg_schedule)
-        row.addWidget(self._fg_morpho_combo)
-        row.addWidget(QLabel("radius"))
-        self._fg_morpho_r = QSpinBox()
-        self._fg_morpho_r.setRange(1, 10)
-        self._fg_morpho_r.setValue(2)
-        self._fg_morpho_r.setToolTip("Structuring element radius (pixels) for the morphological operation")
-        self._fg_morpho_r.valueChanged.connect(self._fg_schedule)
-        row.addWidget(self._fg_morpho_r)
-        pp.addLayout(row)
-
-        row = QHBoxLayout()
-        self._fg_rm_small_chk = QCheckBox("Remove small objects, min size")
-        self._fg_rm_small_chk.setChecked(True)
-        self._fg_rm_small_chk.setToolTip("Remove connected foreground regions smaller than the minimum size")
-        self._fg_rm_small_chk.toggled.connect(self._fg_schedule)
-        row.addWidget(self._fg_rm_small_chk)
-        self._fg_rm_small_spin = QSpinBox()
-        self._fg_rm_small_spin.setRange(0, 1_000_000)
-        self._fg_rm_small_spin.setSingleStep(100)
-        self._fg_rm_small_spin.setValue(500)
-        self._fg_rm_small_spin.setToolTip("Minimum area (pixels) a foreground object must have to be kept")
-        self._fg_rm_small_spin.valueChanged.connect(self._fg_schedule)
-        row.addWidget(self._fg_rm_small_spin)
-        pp.addLayout(row)
-
-        row = QHBoxLayout()
-        self._fg_area_chk = QCheckBox("Area filter")
-        self._fg_area_chk.setToolTip("Keep only foreground objects whose area falls within the min/max range")
-        self._fg_area_chk.toggled.connect(self._fg_schedule)
-        row.addWidget(self._fg_area_chk)
-        row.addWidget(QLabel("min"))
-        self._fg_area_min = QSpinBox()
-        self._fg_area_min.setRange(0, 10_000_000)
-        self._fg_area_min.setSingleStep(100)
-        self._fg_area_min.setValue(100)
-        self._fg_area_min.setToolTip("Minimum object area (pixels) for the area filter")
-        self._fg_area_min.valueChanged.connect(self._fg_schedule)
-        row.addWidget(self._fg_area_min)
-        row.addWidget(QLabel("max"))
-        self._fg_area_max = QSpinBox()
-        self._fg_area_max.setRange(0, 10_000_000)
-        self._fg_area_max.setSingleStep(1000)
-        self._fg_area_max.setValue(100_000)
-        self._fg_area_max.setToolTip("Maximum object area (pixels) for the area filter")
-        self._fg_area_max.valueChanged.connect(self._fg_schedule)
-        row.addWidget(self._fg_area_max)
-        pp.addLayout(row)
-
-        row = QHBoxLayout()
-        self._fg_dist_chk = QCheckBox("Distance filter, min radius")
-        self._fg_dist_chk.setToolTip("Remove objects whose inscribed radius is below the threshold — filters thin/elongated objects")
-        self._fg_dist_chk.toggled.connect(self._fg_schedule)
-        row.addWidget(self._fg_dist_chk)
-        self._fg_dist_r = QDoubleSpinBox()
-        self._fg_dist_r.setRange(1.0, 50.0)
-        self._fg_dist_r.setSingleStep(0.5)
-        self._fg_dist_r.setDecimals(1)
-        self._fg_dist_r.setValue(3.0)
-        self._fg_dist_r.setToolTip("Minimum inscribed radius (pixels) an object must have to survive the distance filter")
-        self._fg_dist_r.valueChanged.connect(self._fg_schedule)
-        row.addWidget(self._fg_dist_r)
-        pp.addLayout(row)
-
-        post.setLayout(pp)
-        lay.addWidget(post)
-
-        # Buttons
-        row = QHBoxLayout()
-        self._fg_preview_btn = QPushButton("Preview")
-        self._fg_preview_btn.clicked.connect(self._fg_on_preview)
-        row.addWidget(self._fg_preview_btn)
-        self._fg_edit_btn = QPushButton("Edit Mask")
-        self._fg_edit_btn.setEnabled(False)
-        self._fg_edit_btn.clicked.connect(self._fg_on_edit_mask)
-        row.addWidget(self._fg_edit_btn)
-        lay.addLayout(row)
-
-        self._fg_overwrite_chk = QCheckBox("Overwrite existing files")
-        lay.addWidget(self._fg_overwrite_chk)
-
-        row = QHBoxLayout()
-        self._fg_run_btn = QPushButton("Run Foreground")
-        self._fg_run_btn.clicked.connect(self._fg_on_run)
-        row.addWidget(self._fg_run_btn)
-        self._fg_term_btn = QPushButton("Run in Terminal")
-        self._fg_term_btn.clicked.connect(self._fg_on_run_terminal)
-        row.addWidget(self._fg_term_btn)
-        self._fg_cancel_btn = QPushButton("Cancel")
-        self._fg_cancel_btn.setEnabled(False)
-        self._fg_cancel_btn.clicked.connect(self._fg_on_cancel)
-        row.addWidget(self._fg_cancel_btn)
-        lay.addLayout(row)
-
-        self._fg_load_btn = QPushButton("Load Results")
-        self._fg_load_btn.clicked.connect(self._fg_on_load_results)
-        lay.addWidget(self._fg_load_btn)
-
-        self._fg_progress = QProgressBar()
-        self._fg_progress.setVisible(False)
-        lay.addWidget(self._fg_progress)
-        self._fg_status = QLabel("")
-        lay.addWidget(self._fg_status)
-
-        grp.setLayout(lay)
-
-        # Initial control state
-        self._fg_sig_center.setEnabled(False)
-        self._fg_sig_steep.setEnabled(False)
-        return grp
-
-    # ── Foreground helpers ────────────────────────────────────────────────
-
-    def _fg_build_config(self) -> ForegroundConfig:
-        return ForegroundConfig(
-            median_filter=self._fg_median_chk.isChecked(),
-            median_radius=self._fg_median_spin.value(),
-            gaussian_filter=self._fg_gauss_chk.isChecked(),
-            gaussian_sigma=self._fg_gauss_spin.value(),
-            clahe=self._fg_clahe_chk.isChecked(),
-            clahe_clip_limit=self._fg_clahe_clip.value(),
-            clahe_kernel_size=self._fg_clahe_kernel.value(),
-            method=self._fg_method_combo.currentText(),
-            threshold=self._fg_thresh_spin.value(),
-            sigmoid_center=self._fg_sig_center.value(),
-            sigmoid_steepness=self._fg_sig_steep.value(),
-            fill_holes=self._fg_fill_chk.isChecked(),
-            fill_holes_max_size=self._fg_fill_spin.value(),
-            morpho_op=self._fg_morpho_combo.currentText(),
-            morpho_radius=self._fg_morpho_r.value(),
-            remove_small=self._fg_rm_small_chk.isChecked(),
-            remove_small_min_size=self._fg_rm_small_spin.value(),
-            area_filter=self._fg_area_chk.isChecked(),
-            area_filter_min=self._fg_area_min.value(),
-            area_filter_max=self._fg_area_max.value(),
-            distance_filter=self._fg_dist_chk.isChecked(),
-            distance_filter_min_radius=self._fg_dist_r.value(),
+        row.addWidget(QLabel("Flow threshold"))
+        self._cp_ct_flow_thresh = QDoubleSpinBox()
+        self._cp_ct_flow_thresh.setMinimum(-999999.0)
+        self._cp_ct_flow_thresh.setMaximum(999999.0)
+        self._cp_ct_flow_thresh.setSingleStep(0.1)
+        self._cp_ct_flow_thresh.setDecimals(1)
+        self._cp_ct_flow_thresh.setValue(0.4)
+        self._cp_ct_flow_thresh.setToolTip(
+            "Cellpose flow consistency threshold. Lower = more strict (fewer cells). Default: 0.4"
         )
-
-    def _fg_apply_config(self, cfg: ForegroundConfig) -> None:
-        self._fg_median_chk.setChecked(cfg.median_filter)
-        self._fg_median_spin.setValue(cfg.median_radius)
-        self._fg_gauss_chk.setChecked(cfg.gaussian_filter)
-        self._fg_gauss_spin.setValue(cfg.gaussian_sigma)
-        self._fg_clahe_chk.setChecked(cfg.clahe)
-        self._fg_clahe_clip.setValue(cfg.clahe_clip_limit)
-        self._fg_clahe_kernel.setValue(cfg.clahe_kernel_size)
-        self._fg_method_combo.setCurrentText(cfg.method)
-        self._fg_thresh_spin.setValue(cfg.threshold)
-        self._fg_sig_center.setValue(cfg.sigmoid_center)
-        self._fg_sig_steep.setValue(cfg.sigmoid_steepness)
-        self._fg_fill_chk.setChecked(cfg.fill_holes)
-        self._fg_fill_spin.setValue(cfg.fill_holes_max_size)
-        self._fg_morpho_combo.setCurrentText(cfg.morpho_op)
-        self._fg_morpho_r.setValue(cfg.morpho_radius)
-        self._fg_rm_small_chk.setChecked(cfg.remove_small)
-        self._fg_rm_small_spin.setValue(cfg.remove_small_min_size)
-        self._fg_area_chk.setChecked(cfg.area_filter)
-        self._fg_area_min.setValue(cfg.area_filter_min)
-        self._fg_area_max.setValue(cfg.area_filter_max)
-        self._fg_dist_chk.setChecked(cfg.distance_filter)
-        self._fg_dist_r.setValue(cfg.distance_filter_min_radius)
-
-    def _fg_on_method_changed(self, method: str) -> None:
-        self._fg_thresh_spin.setEnabled(method == "fixed")
-        self._fg_sig_center.setEnabled(method == "sigmoid")
-        self._fg_sig_steep.setEnabled(method == "sigmoid")
-        self._fg_schedule()
-
-    def _fg_schedule(self) -> None:
-        if self._fg_mag is not None:
-            self._fg_timer.start()
-
-    def _fg_on_preview(self) -> None:
-        paths = self._get_paths()
-        if paths is None:
-            self._fg_status.setText("Set input and output directories first.")
-            return
-        inp, _ = paths
-        prob_files = discover_prob_files(inp)
-        idx = self._fg_tp_spin.value()
-        if not prob_files:
-            self._fg_status.setText("No t*_prob.tif files found.")
-            return
-        if idx >= len(prob_files):
-            self._fg_status.setText(f"Only {len(prob_files)} timepoints available.")
-            return
-        self._fg_status.setText(f"Loading {prob_files[idx].name}\u2026")
-        self._fg_mag = load_prob_map(prob_files[idx])
-        if self._fg_mag_layer is None or self._fg_mag_layer not in self.viewer.layers:
-            self._fg_mag_layer = self.viewer.add_image(
-                self._fg_mag, name="cell probability", colormap="inferno"
-            )
-        else:
-            self._fg_mag_layer.data = self._fg_mag
-        self._fg_update_preview()
-        self._fg_edit_btn.setEnabled(True)
-        self._fg_status.setText(f"Preview: {prob_files[idx].name}")
-
-    def _fg_update_preview(self) -> None:
-        if self._fg_mag is None:
-            return
-        cfg = self._fg_build_config()
-        has_preproc = cfg.median_filter or cfg.gaussian_filter or cfg.clahe
-        if has_preproc:
-            pre = apply_blur(self._fg_mag, cfg)
-            pre = apply_clahe(pre, cfg)
-            if self._fg_preproc_layer is None or self._fg_preproc_layer not in self.viewer.layers:
-                self._fg_preproc_layer = self.viewer.add_image(
-                    pre, name="preprocessed magnitude", colormap="magma"
-                )
-            else:
-                self._fg_preproc_layer.data = pre
-        elif self._fg_preproc_layer is not None and self._fg_preproc_layer in self.viewer.layers:
-            self.viewer.layers.remove(self._fg_preproc_layer)
-            self._fg_preproc_layer = None
-        mask = compute_foreground_from_mag(self._fg_mag, cfg)
-        if self._fg_preview_layer is None or self._fg_preview_layer not in self.viewer.layers:
-            self._fg_preview_layer = self.viewer.add_labels(
-                mask.astype(np.int32), name="foreground preview"
-            )
-        else:
-            self._fg_preview_layer.data = mask.astype(np.int32)
-
-    def _fg_on_edit_mask(self) -> None:
-        if self._fg_preview_layer is not None and self._fg_preview_layer in self.viewer.layers:
-            self.viewer.layers.selection.active = self._fg_preview_layer
-            self._fg_preview_layer.mode = "paint"
-            self._fg_status.setText("Editing mask — use paint (1) / erase (0) tools.")
-
-    def _fg_on_run(self) -> None:
-        paths = self._get_paths()
-        if paths is None:
-            self._fg_status.setText("Set input and output directories first.")
-            return
-        inp, out = paths
-        fg_out = out
-        cfg = self._fg_build_config()
-        overwrite = self._fg_overwrite_chk.isChecked()
-        self._fg_run_btn.setEnabled(False)
-        self._fg_cancel_btn.setEnabled(True)
-        self._fg_progress.setVisible(True)
-        self._fg_status.setText("Starting\u2026")
-
-        @thread_worker(connect={
-            "yielded": self._fg_on_progress,
-            "finished": self._fg_on_finished,
-            "errored": self._fg_on_error,
-        })
-        def _work():
-            for u in run_s02(inp, fg_out, cfg, overwrite=overwrite):
-                yield u
-
-        self._fg_worker = _work()
-        self._fg_worker.aborted.connect(self._fg_on_cancelled)
-
-    def _fg_on_run_terminal(self) -> None:
-        paths = self._get_paths()
-        if paths is None:
-            self._fg_status.setText("Set input and output directories first.")
-            return
-        inp, out = paths
-        fg_out = out
-        cfg = self._fg_build_config()
-        cfg_path = Path(tempfile.mktemp(suffix="_fg_config.json"))
-        cfg_path.write_text(json.dumps(cfg.model_dump(), indent=2))
-        overwrite_flag = "--overwrite" if self._fg_overwrite_chk.isChecked() else ""
-        cmd = (
-            f"python -m ultrack_wrapper.stages.s02_foreground"
-            f" --input-dir \"{inp}\""
-            f" --output-dir \"{fg_out}\""
-            f" --config \"{cfg_path}\""
-            f" {overwrite_flag}"
-        ).strip()
-        try:
-            launch_in_terminal(cmd)
-            self._fg_status.setText("Launched foreground in terminal.")
-        except Exception as e:
-            self._fg_status.setText(f"Terminal error: {e}")
-
-    def _fg_on_progress(self, u: tuple) -> None:
-        done, total, label = u
-        self._fg_progress.setMaximum(max(total, 1))
-        self._fg_progress.setValue(done)
-        self._fg_status.setText(f"[{done}/{total}] {label}")
-
-    def _fg_on_cancel(self) -> None:
-        if self._fg_worker is not None:
-            self._fg_worker.quit()
-
-    def _fg_on_cancelled(self) -> None:
-        self._fg_run_btn.setEnabled(True)
-        self._fg_cancel_btn.setEnabled(False)
-        self._fg_progress.setVisible(False)
-        self._fg_worker = None
-        self._fg_status.setText("Cancelled.")
-
-    def _fg_on_finished(self) -> None:
-        self._fg_run_btn.setEnabled(True)
-        self._fg_cancel_btn.setEnabled(False)
-        self._fg_progress.setVisible(False)
-        self._fg_worker = None
-        self._fg_status.setText("Done \u2014 foreground.tif written.")
-        self._fg_load_stack()
-
-    def _fg_on_error(self, exc: Exception) -> None:
-        self._fg_run_btn.setEnabled(True)
-        self._fg_cancel_btn.setEnabled(False)
-        self._fg_progress.setVisible(False)
-        self._fg_worker = None
-        self._fg_status.setText(f"Error: {exc}")
-
-    def _fg_load_stack(self) -> None:
-        paths = self._get_paths()
-        if paths is None:
-            return
-        p = Path(paths[1]) / "foreground.tif"
-        if not p.exists():
-            self._fg_status.setText("foreground.tif not found.")
-            return
-        stack = tifffile.imread(str(p))
-        self.viewer.add_labels(stack.astype(np.int32), name="foreground")
-        self._fg_status.setText(f"Loaded foreground: {stack.shape}")
-
-    def _fg_on_load_results(self) -> None:
-        self._fg_load_stack()
-
-    # ══════════════════════════════════════════════════════════════════════
-    # CONTOURS section
-    # ══════════════════════════════════════════════════════════════════════
-
-    def _build_contours_section(self) -> QGroupBox:
-        grp = QGroupBox("Contours")
-        lay = QVBoxLayout()
-
-        # Preview timepoint
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Preview timepoint"))
-        self._ct_tp_spin = QSpinBox()
-        self._ct_tp_spin.setRange(0, 9999)
-        self._ct_tp_spin.setToolTip("Index of the timepoint to use for live preview")
-        row.addWidget(self._ct_tp_spin)
+        row.addWidget(self._cp_ct_flow_thresh)
         lay.addLayout(row)
 
-        # Method
+        # Cell probability threshold(s)
         row = QHBoxLayout()
-        row.addWidget(QLabel("Method"))
-        self._ct_method = QComboBox()
-        self._ct_method.addItems(["probmap", "watershed", "combined"])
-        self._ct_method.setCurrentText("combined")
-        self._ct_method.setToolTip("Edge map algorithm: \"probmap\" inverts cell probability; \"watershed\" uses UCM; \"combined\" blends both")
-        self._ct_method.currentTextChanged.connect(self._ct_on_method_changed)
-        row.addWidget(self._ct_method)
+        row.addWidget(QLabel("Cellprob threshold(s)"))
+        self._cp_ct_cellprob_thresh = QLineEdit()
+        self._cp_ct_cellprob_thresh.setText("0.0")
+        self._cp_ct_cellprob_thresh.setToolTip(
+            "Comma-separated cellprob thresholds to average together. "
+            "E.g., '-5, -2.5, 0, 2.5, 5' or '0.0' for single value"
+        )
+        row.addWidget(self._cp_ct_cellprob_thresh)
         lay.addLayout(row)
 
+        # 3D mode checkbox
+        self._cp_ct_3d_chk = QCheckBox("Use 3D")
+        self._cp_ct_3d_chk.setChecked(True)
+        self._cp_ct_3d_chk.setToolTip("Use 3D flow-based segmentation (requires 3D dP files)")
+        lay.addWidget(self._cp_ct_3d_chk)
+
+        # Device selection
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Device"))
+        self._cp_ct_device = QComboBox()
+        self._cp_ct_device.addItems(["cuda", "cpu"])
+        self._cp_ct_device.setCurrentText("cuda")
+        self._cp_ct_device.setToolTip("GPU (cuda) or CPU for mask computation")
+        row.addWidget(self._cp_ct_device)
+        lay.addLayout(row)
+
+        # Smooth sigma
         row = QHBoxLayout()
         row.addWidget(QLabel("Smooth sigma"))
-        self._ct_sigma = QDoubleSpinBox()
-        self._ct_sigma.setRange(0.0, 20.0)
-        self._ct_sigma.setSingleStep(0.5)
-        self._ct_sigma.setDecimals(1)
-        self._ct_sigma.setValue(1.0)
-        self._ct_sigma.setToolTip("Gaussian smoothing applied to the final contour map; larger values give smoother but less sharp edges")
-        self._ct_sigma.valueChanged.connect(self._ct_schedule)
-        row.addWidget(self._ct_sigma)
-        lay.addLayout(row)
-
-        row = QHBoxLayout()
-        row.addWidget(QLabel("w_prob"))
-        self._ct_w_prob = QDoubleSpinBox()
-        self._ct_w_prob.setRange(0.0, 1.0)
-        self._ct_w_prob.setSingleStep(0.1)
-        self._ct_w_prob.setDecimals(2)
-        self._ct_w_prob.setValue(0.4)
-        self._ct_w_prob.setToolTip("Weight of the probability-map component in the \"combined\" blend (w_prob + w_ws must equal 1)")
-        self._ct_w_prob.valueChanged.connect(self._ct_on_w_prob)
-        row.addWidget(self._ct_w_prob)
-        row.addWidget(QLabel("w_ws"))
-        self._ct_w_ws = QDoubleSpinBox()
-        self._ct_w_ws.setRange(0.0, 1.0)
-        self._ct_w_ws.setSingleStep(0.1)
-        self._ct_w_ws.setDecimals(2)
-        self._ct_w_ws.setValue(0.6)
-        self._ct_w_ws.setToolTip("Weight of the watershed UCM component in the \"combined\" blend (w_prob + w_ws must equal 1)")
-        self._ct_w_ws.valueChanged.connect(self._ct_on_w_ws)
-        row.addWidget(self._ct_w_ws)
-        lay.addLayout(row)
-
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Min seed dist"))
-        self._ct_seed_dist = QSpinBox()
-        self._ct_seed_dist.setRange(1, 50)
-        self._ct_seed_dist.setValue(5)
-        self._ct_seed_dist.setToolTip("Minimum distance (pixels) between watershed seeds; larger values merge nearby cells")
-        self._ct_seed_dist.valueChanged.connect(self._ct_schedule)
-        row.addWidget(self._ct_seed_dist)
-        row.addWidget(QLabel("FG thresh"))
-        self._ct_fg_thresh = QDoubleSpinBox()
-        self._ct_fg_thresh.setRange(0.0, 1.0)
-        self._ct_fg_thresh.setSingleStep(0.05)
-        self._ct_fg_thresh.setDecimals(2)
-        self._ct_fg_thresh.setValue(0.3)
-        self._ct_fg_thresh.setToolTip("Foreground probability threshold used to define the watershed basin mask")
-        self._ct_fg_thresh.valueChanged.connect(self._ct_schedule)
-        row.addWidget(self._ct_fg_thresh)
+        self._cp_ct_smooth_sigma = QDoubleSpinBox()
+        self._cp_ct_smooth_sigma.setMinimum(-999999.0)
+        self._cp_ct_smooth_sigma.setMaximum(999999.0)
+        self._cp_ct_smooth_sigma.setSingleStep(0.5)
+        self._cp_ct_smooth_sigma.setDecimals(1)
+        self._cp_ct_smooth_sigma.setValue(0.5)
+        self._cp_ct_smooth_sigma.setToolTip("Gaussian smoothing applied to final contours map")
+        row.addWidget(self._cp_ct_smooth_sigma)
         lay.addLayout(row)
 
         # Buttons
         row = QHBoxLayout()
-        self._ct_preview_btn = QPushButton("Preview")
-        self._ct_preview_btn.clicked.connect(self._ct_on_preview)
-        row.addWidget(self._ct_preview_btn)
+        self._cp_ct_preview_btn = QPushButton("Preview")
+        self._cp_ct_preview_btn.clicked.connect(self._cp_ct_on_preview)
+        row.addWidget(self._cp_ct_preview_btn)
         lay.addLayout(row)
 
-        self._ct_overwrite_chk = QCheckBox("Overwrite existing files")
-        lay.addWidget(self._ct_overwrite_chk)
+        self._cp_ct_overwrite_chk = QCheckBox("Overwrite existing files")
+        lay.addWidget(self._cp_ct_overwrite_chk)
 
         row = QHBoxLayout()
-        self._ct_run_btn = QPushButton("Run Contours")
-        self._ct_run_btn.clicked.connect(self._ct_on_run)
-        row.addWidget(self._ct_run_btn)
-        self._ct_term_btn = QPushButton("Run in Terminal")
-        self._ct_term_btn.clicked.connect(self._ct_on_run_terminal)
-        row.addWidget(self._ct_term_btn)
-        self._ct_cancel_btn = QPushButton("Cancel")
-        self._ct_cancel_btn.setEnabled(False)
-        self._ct_cancel_btn.clicked.connect(self._ct_on_cancel)
-        row.addWidget(self._ct_cancel_btn)
+        self._cp_ct_run_btn = QPushButton("Run Contours (Cellpose)")
+        self._cp_ct_run_btn.clicked.connect(self._cp_ct_on_run)
+        row.addWidget(self._cp_ct_run_btn)
+        self._cp_ct_term_btn = QPushButton("Run in Terminal")
+        self._cp_ct_term_btn.clicked.connect(self._cp_ct_on_run_terminal)
+        row.addWidget(self._cp_ct_term_btn)
+        self._cp_ct_cancel_btn = QPushButton("Cancel")
+        self._cp_ct_cancel_btn.setEnabled(False)
+        self._cp_ct_cancel_btn.clicked.connect(self._cp_ct_on_cancel)
+        row.addWidget(self._cp_ct_cancel_btn)
         lay.addLayout(row)
 
-        self._ct_load_btn = QPushButton("Load Results")
-        self._ct_load_btn.clicked.connect(self._ct_on_load_results)
-        lay.addWidget(self._ct_load_btn)
+        self._cp_ct_load_btn = QPushButton("Load Results")
+        self._cp_ct_load_btn.clicked.connect(self._cp_ct_on_load_results)
+        lay.addWidget(self._cp_ct_load_btn)
 
-        self._ct_progress = QProgressBar()
-        self._ct_progress.setVisible(False)
-        lay.addWidget(self._ct_progress)
-        self._ct_status = QLabel("")
-        lay.addWidget(self._ct_status)
+        self._cp_ct_progress = QProgressBar()
+        self._cp_ct_progress.setVisible(False)
+        lay.addWidget(self._cp_ct_progress)
+        self._cp_ct_status = QLabel("")
+        lay.addWidget(self._cp_ct_status)
 
         grp.setLayout(lay)
-        self._ct_on_method_changed(self._ct_method.currentText())
         return grp
 
-    # ── Contours helpers ──────────────────────────────────────────────────
+    # ── Cellpose Contours helpers ────────────────────────────────────────
 
-    def _ct_build_config(self) -> ContoursConfig:
-        return ContoursConfig(
-            method=self._ct_method.currentText(),
-            smooth_sigma=self._ct_sigma.value(),
-            w_prob=self._ct_w_prob.value(),
-            w_ws=self._ct_w_ws.value(),
-            min_seed_dist=self._ct_seed_dist.value(),
-            fg_thresh=self._ct_fg_thresh.value(),
+    def _cp_ct_build_config(self) -> CellposeContoursConfig:
+        """Build config from current UI state."""
+        # Use first threshold for single-run config, or 0.0 if list is empty
+        thresh_str = self._cp_ct_cellprob_thresh.text().strip()
+        try:
+            thresholds = [float(x.strip()) for x in thresh_str.split(',') if x.strip()]
+            cellprob_threshold = thresholds[0] if thresholds else 0.0
+        except ValueError:
+            cellprob_threshold = 0.0
+
+        return CellposeContoursConfig(
+            flow_threshold=self._cp_ct_flow_thresh.value(),
+            cellprob_threshold=cellprob_threshold,
+            do_3D=self._cp_ct_3d_chk.isChecked(),
+            smooth_sigma=self._cp_ct_smooth_sigma.value(),
+            device=self._cp_ct_device.currentText(),
         )
 
-    def _ct_apply_config(self, cfg: ContoursConfig) -> None:
-        self._ct_method.setCurrentText(cfg.method)
-        self._ct_sigma.setValue(cfg.smooth_sigma)
-        self._ct_w_prob.setValue(cfg.w_prob)
-        self._ct_w_ws.setValue(cfg.w_ws)
-        self._ct_seed_dist.setValue(cfg.min_seed_dist)
-        self._ct_fg_thresh.setValue(cfg.fg_thresh)
+    def _cp_ct_apply_config(self, cfg: CellposeContoursConfig) -> None:
+        """Apply config to UI."""
+        self._cp_ct_flow_thresh.setValue(cfg.flow_threshold)
+        self._cp_ct_cellprob_thresh.setText(str(cfg.cellprob_threshold))
+        self._cp_ct_3d_chk.setChecked(cfg.do_3D)
+        self._cp_ct_smooth_sigma.setValue(cfg.smooth_sigma)
+        self._cp_ct_device.setCurrentText(cfg.device)
 
-    def _ct_on_method_changed(self, method: str) -> None:
-        is_combined = method == "combined"
-        uses_ws = method in ("watershed", "combined")
-        self._ct_w_prob.setEnabled(is_combined)
-        self._ct_w_ws.setEnabled(is_combined)
-        self._ct_seed_dist.setEnabled(uses_ws)
-        self._ct_fg_thresh.setEnabled(uses_ws)
-        self._ct_schedule()
+    def _cp_ct_schedule(self) -> None:
+        """Schedule a debounced preview update if data is cached."""
+        if self._cp_ct_dp is not None and self._cp_ct_prob is not None:
+            self._cp_ct_timer.start()
 
-    def _ct_on_w_prob(self, val: float) -> None:
-        self._ct_w_ws.blockSignals(True)
-        self._ct_w_ws.setValue(round(1.0 - val, 2))
-        self._ct_w_ws.blockSignals(False)
-        self._ct_schedule()
-
-    def _ct_on_w_ws(self, val: float) -> None:
-        self._ct_w_prob.blockSignals(True)
-        self._ct_w_prob.setValue(round(1.0 - val, 2))
-        self._ct_w_prob.blockSignals(False)
-        self._ct_schedule()
-
-    def _ct_schedule(self) -> None:
-        if self._ct_prob is not None:
-            self._ct_timer.start()
-
-    def _ct_on_preview(self) -> None:
+    def _cp_ct_on_preview(self) -> None:
+        """Load dP and prob maps for a range of timepoints."""
         paths = self._get_paths()
         if paths is None:
-            self._ct_status.setText("Set input and output directories first.")
+            self._cp_ct_status.setText("Set input and output directories first.")
             return
         inp, _ = paths
-        from ultrack_wrapper.stages.s02b_contours import discover_prob_files as disc, load_prob_map as lpm
-        prob_files = disc(inp)
-        idx = self._ct_tp_spin.value()
-        if not prob_files:
-            self._ct_status.setText("No t*_prob.tif files found.")
-            return
-        if idx >= len(prob_files):
-            self._ct_status.setText(f"Only {len(prob_files)} timepoints available.")
-            return
-        self._ct_status.setText(f"Loading {prob_files[idx].name}\u2026")
-        self._ct_prob = lpm(prob_files[idx])
-        self._ct_update_preview()
-        self._ct_status.setText(f"Preview: {prob_files[idx].name}")
 
-    def _ct_update_preview(self) -> None:
-        if self._ct_prob is None:
+        dp_files = discover_dp_files(inp)
+        prob_files = discover_prob_files(inp)
+        start = self._cp_ct_tp_start.value()
+        end = self._cp_ct_tp_end.value()
+        step = self._cp_ct_tp_step.value()
+
+        if not dp_files or not prob_files:
+            self._cp_ct_status.setText("No t*_dp.tif or t*_prob.tif files found.")
             return
-        cfg = self._ct_build_config()
-        contours, fg = compute_contours_from_array(self._ct_prob, cfg)
-        if self._ct_contours_layer is None or self._ct_contours_layer not in self.viewer.layers:
-            self._ct_contours_layer = self.viewer.add_image(
-                contours, name="contours preview", colormap="hot"
+
+        if len(dp_files) != len(prob_files):
+            self._cp_ct_status.setText(f"Mismatch: {len(dp_files)} dp vs {len(prob_files)} prob files.")
+            return
+
+        if end >= len(dp_files):
+            self._cp_ct_status.setText(f"Only {len(dp_files)} timepoints available.")
+            return
+
+        # Load all timepoints in range
+        indices = range(start, end + 1, step)
+        self._cp_ct_status.setText(f"Loading {len(indices)} timepoint(s)\u2026")
+
+        dp_list = []
+        prob_list = []
+        for idx in indices:
+            dp = tifffile.imread(str(dp_files[idx])).astype(np.float32)
+            prob = tifffile.imread(str(prob_files[idx])).astype(np.float32)
+            dp_list.append(dp)
+            prob_list.append(prob)
+
+        # Store as stacks for preview
+        self._cp_ct_dp_stack = np.stack(dp_list, axis=0)
+        self._cp_ct_prob_stack = np.stack(prob_list, axis=0)
+        self._cp_ct_update_preview()
+        self._cp_ct_status.setText(f"Preview: timepoints {start}-{end} step {step}")
+
+    def _cp_ct_update_preview(self) -> None:
+        """Update preview with current configuration, averaging multiple cellprob thresholds."""
+        # Check if we have stack data or single frame
+        if hasattr(self, '_cp_ct_dp_stack') and self._cp_ct_dp_stack is not None:
+            dp_data = self._cp_ct_dp_stack
+            prob_data = self._cp_ct_prob_stack
+            is_stack = dp_data.ndim == 3  # (T, H, W)
+        elif hasattr(self, '_cp_ct_dp') and self._cp_ct_dp is not None:
+            dp_data = self._cp_ct_dp
+            prob_data = self._cp_ct_prob
+            is_stack = False
+        else:
+            return
+
+        # Parse comma-separated cellprob thresholds
+        thresh_str = self._cp_ct_cellprob_thresh.text().strip()
+        try:
+            thresholds = [float(x.strip()) for x in thresh_str.split(',') if x.strip()]
+        except ValueError:
+            self._cp_ct_status.setText("Error: Invalid cellprob threshold values (use comma-separated floats)")
+            return
+
+        if not thresholds:
+            self._cp_ct_status.setText("Error: No cellprob thresholds specified")
+            return
+
+        cfg = self._cp_ct_build_config()
+
+        # Process single frame or stack
+        if is_stack:
+            num_frames = dp_data.shape[0]
+            all_labels = []
+            all_fg = []
+            all_contours = []
+
+            for frame_idx in range(num_frames):
+                frame_labels_list = []
+                frame_fg_list = []
+                frame_contours_list = []
+
+                for thresh in thresholds:
+                    cfg.cellprob_threshold = thresh
+                    try:
+                        labels, fg, contours = compute_cp_contours_single(
+                            dp_data[frame_idx], prob_data[frame_idx], cfg
+                        )
+                        frame_labels_list.append(labels)
+                        frame_fg_list.append(fg)
+                        frame_contours_list.append(contours)
+                    except Exception as e:
+                        self._cp_ct_status.setText(f"Error frame {frame_idx} threshold {thresh}: {e}")
+                        return
+
+                # Average thresholds for this frame
+                all_labels.append(frame_labels_list[0])
+                all_fg.append(np.mean(frame_fg_list, axis=0))
+                all_contours.append(np.mean(frame_contours_list, axis=0))
+
+            labels_stack = np.stack(all_labels, axis=0)
+            fg_stack = np.stack(all_fg, axis=0)
+            contours_stack = np.stack(all_contours, axis=0)
+        else:
+            # Single frame
+            contours_list = []
+            labels_list = []
+            fg_list = []
+
+            for thresh in thresholds:
+                cfg.cellprob_threshold = thresh
+                try:
+                    labels, fg, contours = compute_cp_contours_single(dp_data, prob_data, cfg)
+                    labels_list.append(labels)
+                    fg_list.append(fg)
+                    contours_list.append(contours)
+                except Exception as e:
+                    self._cp_ct_status.setText(f"Error computing threshold {thresh}: {e}")
+                    return
+
+            labels_stack = labels_list[0]
+            fg_stack = np.mean(fg_list, axis=0)
+            contours_stack = np.mean(contours_list, axis=0)
+
+        # Update or create labels layer
+        if self._cp_ct_labels_layer is None or self._cp_ct_labels_layer not in self.viewer.layers:
+            self._cp_ct_labels_layer = self.viewer.add_labels(
+                labels_stack.astype(np.uint32), name="cp labels preview"
             )
         else:
-            self._ct_contours_layer.data = contours
-        if self._ct_fg_layer is None or self._ct_fg_layer not in self.viewer.layers:
-            self._ct_fg_layer = self.viewer.add_image(
-                fg, name="sigmoid foreground", colormap="green", visible=False
+            self._cp_ct_labels_layer.data = labels_stack.astype(np.uint32)
+
+        # Update or create contours layer
+        if (
+            self._cp_ct_contours_layer is None
+            or self._cp_ct_contours_layer not in self.viewer.layers
+        ):
+            self._cp_ct_contours_layer = self.viewer.add_image(
+                contours_stack, name="cp contours preview", colormap="hot"
             )
         else:
-            self._ct_fg_layer.data = fg
+            self._cp_ct_contours_layer.data = contours_stack
 
-    def _ct_on_run(self) -> None:
+        # Update or create foreground layer
+        if self._cp_ct_fg_layer is None or self._cp_ct_fg_layer not in self.viewer.layers:
+            self._cp_ct_fg_layer = self.viewer.add_image(
+                fg_stack, name="cp foreground preview", colormap="green", visible=False
+            )
+        else:
+            self._cp_ct_fg_layer.data = fg_stack
+
+        threshold_count = len(thresholds)
+        frame_count = num_frames if is_stack else 1
+        self._cp_ct_status.setText(f"Preview: {frame_count} frame(s) × {threshold_count} threshold(s)")
+
+    def _cp_ct_on_run(self) -> None:
+        """Run cellpose contours stage in background."""
         paths = self._get_paths()
         if paths is None:
-            self._ct_status.setText("Set input and output directories first.")
+            self._cp_ct_status.setText("Set input and output directories first.")
             return
         inp, out = paths
-        ct_out = out
-        cfg = self._ct_build_config()
-        overwrite = self._ct_overwrite_chk.isChecked()
-        self._ct_run_btn.setEnabled(False)
-        self._ct_cancel_btn.setEnabled(True)
-        self._ct_progress.setVisible(True)
-        self._ct_status.setText("Starting\u2026")
+        cfg = self._cp_ct_build_config()
+        overwrite = self._cp_ct_overwrite_chk.isChecked()
+        self._cp_ct_run_btn.setEnabled(False)
+        self._cp_ct_cancel_btn.setEnabled(True)
+        self._cp_ct_progress.setVisible(True)
+        self._cp_ct_status.setText("Starting\u2026")
 
-        @thread_worker(connect={
-            "yielded": self._ct_on_progress,
-            "finished": self._ct_on_finished,
-            "errored": self._ct_on_error,
-        })
+        @thread_worker(
+            connect={
+                "yielded": self._cp_ct_on_progress,
+                "finished": self._cp_ct_on_finished,
+                "errored": self._cp_ct_on_error,
+            }
+        )
         def _work():
-            for u in run_s02b(inp, ct_out, cfg, overwrite=overwrite):
+            for u in run_s02c(inp, out, cfg, overwrite=overwrite):
                 yield u
 
-        self._ct_worker = _work()
-        self._ct_worker.aborted.connect(self._ct_on_cancelled)
+        self._cp_ct_worker = _work()
+        self._cp_ct_worker.aborted.connect(self._cp_ct_on_cancelled)
 
-    def _ct_on_run_terminal(self) -> None:
+    def _cp_ct_on_run_terminal(self) -> None:
+        """Launch cellpose contours in terminal."""
         paths = self._get_paths()
         if paths is None:
-            self._ct_status.setText("Set input and output directories first.")
+            self._cp_ct_status.setText("Set input and output directories first.")
             return
         inp, out = paths
-        ct_out = out
-        cfg = self._ct_build_config()
-        cfg_path = Path(tempfile.mktemp(suffix="_ct_config.json"))
+        cfg = self._cp_ct_build_config()
+        cfg_path = Path(tempfile.mktemp(suffix="_cp_ct_config.json"))
         cfg_path.write_text(json.dumps(cfg.model_dump(), indent=2))
-        overwrite_flag = "--overwrite" if self._ct_overwrite_chk.isChecked() else ""
+        overwrite_flag = "--overwrite" if self._cp_ct_overwrite_chk.isChecked() else ""
         cmd = (
-            f"python -m ultrack_wrapper.stages.s02b_contours"
+            f"python -m ultrack_wrapper.stages.s02c_cellpose_contours"
             f" --input-dir \"{inp}\""
-            f" --output-dir \"{ct_out}\""
+            f" --output-dir \"{out}\""
             f" --config \"{cfg_path}\""
             f" {overwrite_flag}"
         ).strip()
         try:
             launch_in_terminal(cmd)
-            self._ct_status.setText("Launched contours in terminal.")
+            self._cp_ct_status.setText("Launched cellpose contours in terminal.")
         except Exception as e:
-            self._ct_status.setText(f"Terminal error: {e}")
+            self._cp_ct_status.setText(f"Terminal error: {e}")
 
-    def _ct_on_progress(self, u: tuple) -> None:
+    def _cp_ct_on_progress(self, u: tuple) -> None:
+        """Update progress bar during run."""
         done, total, label = u
-        self._ct_progress.setMaximum(max(total, 1))
-        self._ct_progress.setValue(done)
-        self._ct_status.setText(f"[{done}/{total}] {label}")
+        self._cp_ct_progress.setMaximum(max(total, 1))
+        self._cp_ct_progress.setValue(done)
+        self._cp_ct_status.setText(f"[{done}/{total}] {label}")
 
-    def _ct_on_cancel(self) -> None:
-        if self._ct_worker is not None:
-            self._ct_worker.quit()
+    def _cp_ct_on_cancel(self) -> None:
+        """Cancel the run."""
+        if self._cp_ct_worker is not None:
+            self._cp_ct_worker.quit()
 
-    def _ct_on_cancelled(self) -> None:
-        self._ct_run_btn.setEnabled(True)
-        self._ct_cancel_btn.setEnabled(False)
-        self._ct_progress.setVisible(False)
-        self._ct_worker = None
-        self._ct_status.setText("Cancelled.")
+    def _cp_ct_on_cancelled(self) -> None:
+        """Handle cancelled state."""
+        self._cp_ct_run_btn.setEnabled(True)
+        self._cp_ct_cancel_btn.setEnabled(False)
+        self._cp_ct_progress.setVisible(False)
+        self._cp_ct_worker = None
+        self._cp_ct_status.setText("Cancelled.")
 
-    def _ct_on_finished(self) -> None:
-        self._ct_run_btn.setEnabled(True)
-        self._ct_cancel_btn.setEnabled(False)
-        self._ct_progress.setVisible(False)
-        self._ct_worker = None
-        self._ct_status.setText("Done \u2014 contours.tif written.")
-        self._ct_load_stack()
+    def _cp_ct_on_finished(self) -> None:
+        """Handle successful completion."""
+        self._cp_ct_run_btn.setEnabled(True)
+        self._cp_ct_cancel_btn.setEnabled(False)
+        self._cp_ct_progress.setVisible(False)
+        self._cp_ct_worker = None
+        self._cp_ct_status.setText("Done \u2014 foreground.tif and contours.tif written.")
+        self._cp_ct_load_stack()
 
-    def _ct_on_error(self, exc: Exception) -> None:
-        self._ct_run_btn.setEnabled(True)
-        self._ct_cancel_btn.setEnabled(False)
-        self._ct_progress.setVisible(False)
-        self._ct_worker = None
-        self._ct_status.setText(f"Error: {exc}")
+    def _cp_ct_on_error(self, exc: Exception) -> None:
+        """Handle error."""
+        self._cp_ct_run_btn.setEnabled(True)
+        self._cp_ct_cancel_btn.setEnabled(False)
+        self._cp_ct_progress.setVisible(False)
+        self._cp_ct_worker = None
+        self._cp_ct_status.setText(f"Error: {exc}")
 
-    def _ct_load_stack(self) -> None:
+    def _cp_ct_load_stack(self) -> None:
+        """Load output files from disk."""
         paths = self._get_paths()
         if paths is None:
             return
-        p = Path(paths[1]) / "contours.tif"
-        if not p.exists():
-            self._ct_status.setText("contours.tif not found.")
+        fg_path = Path(paths[1]) / "foreground.tif"
+        ct_path = Path(paths[1]) / "contours.tif"
+        if not fg_path.exists():
+            self._cp_ct_status.setText("foreground.tif not found.")
             return
-        stack = tifffile.imread(str(p))
-        self.viewer.add_image(stack, name="contours", colormap="hot")
-        self._ct_status.setText(f"Loaded contours: {stack.shape}")
+        if not ct_path.exists():
+            self._cp_ct_status.setText("contours.tif not found.")
+            return
+        fg_stack = tifffile.imread(str(fg_path))
+        ct_stack = tifffile.imread(str(ct_path))
+        self.viewer.add_image(fg_stack, name="cp foreground", colormap="green")
+        self.viewer.add_image(ct_stack, name="cp contours", colormap="hot")
+        self._cp_ct_status.setText(f"Loaded foreground + contours: {fg_stack.shape}")
 
-    def _ct_on_load_results(self) -> None:
-        self._ct_load_stack()
+    def _cp_ct_on_load_results(self) -> None:
+        """Load results button handler."""
+        self._cp_ct_load_stack()
 
     # ══════════════════════════════════════════════════════════════════════
     # TRACKING section
@@ -2121,10 +1768,8 @@ class UltrackAnalysisWidget(QWidget):
         fg_path = str(out_p / "foreground.tif")
         ct_path = str(out_p / "contours.tif")
 
-        fg_cfg = self._fg_build_config()
-        fg_ow = self._fg_overwrite_chk.isChecked()
-        ct_cfg = self._ct_build_config()
-        ct_ow = self._ct_overwrite_chk.isChecked()
+        cp_ct_cfg = self._cp_ct_build_config()
+        cp_ct_ow = self._cp_ct_overwrite_chk.isChecked()
         tr_cfg = self._tr_build_config()
 
         # Tracking skip: skip when all overwrite flags are False and outputs already exist
@@ -2149,32 +1794,23 @@ class UltrackAnalysisWidget(QWidget):
             "errored": self._on_all_error,
         })
         def _work():
-            # Foreground
-            if not fg_ow and (out_path / "foreground.tif").exists():
-                yield (0, 100, "[Foreground] Skipping \u2014 output exists (overwrite unchecked)")
+            # Cellpose Contours
+            if not cp_ct_ow and (out_path / "foreground.tif").exists() and (out_path / "contours.tif").exists():
+                yield (0, 100, "[Cellpose Contours] Skipping \u2014 output exists (overwrite unchecked)")
             else:
-                yield (0, 100, "[Foreground] Starting\u2026")
-                for done, total, label in run_s02(inp, out, fg_cfg, overwrite=fg_ow):
-                    yield (int(done / max(total, 1) * 30), 100,
-                           f"[Foreground] {label} [{done}/{total}]")
-
-            # Contours
-            if not ct_ow and (out_path / "contours.tif").exists():
-                yield (30, 100, "[Contours] Skipping \u2014 output exists (overwrite unchecked)")
-            else:
-                yield (30, 100, "[Contours] Starting\u2026")
-                for done, total, label in run_s02b(inp, out, ct_cfg, overwrite=ct_ow):
-                    yield (30 + int(done / max(total, 1) * 30), 100,
-                           f"[Contours] {label} [{done}/{total}]")
+                yield (0, 100, "[Cellpose Contours] Starting\u2026")
+                for done, total, label in run_s02c(inp, out, cp_ct_cfg, overwrite=cp_ct_ow):
+                    yield (int(done / max(total, 1) * 50), 100,
+                           f"[Cellpose Contours] {label} [{done}/{total}]")
 
             # Tracking
             if tr_skip:
-                yield (60, 100, "[Tracking] Skipping \u2014 output exists (overwrite=none)")
+                yield (50, 100, "[Tracking] Skipping \u2014 output exists (overwrite=none)")
                 yield (100, 100, "Run All complete.")
             else:
-                yield (60, 100, "[Tracking] Starting\u2026")
+                yield (50, 100, "[Tracking] Starting\u2026")
                 for step, total_steps, label in run_s03(fg_path, ct_path, out, tr_cfg):
-                    yield (60 + int(step / max(total_steps, 1) * 40), 100,
+                    yield (50 + int(step / max(total_steps, 1) * 50), 100,
                            f"[Tracking] {label}")
                 yield (100, 100, "Run All complete.")
 
@@ -2224,8 +1860,7 @@ class UltrackAnalysisWidget(QWidget):
         if not path:
             return
         data = {
-            "foreground": self._fg_build_config().model_dump(),
-            "contours": self._ct_build_config().model_dump(),
+            "cp_contours": self._cp_ct_build_config().model_dump(),
             "tracking": self._tr_build_config().model_dump(),
         }
         Path(path).write_text(json.dumps(data, indent=2))
@@ -2237,9 +1872,7 @@ class UltrackAnalysisWidget(QWidget):
         if not path:
             return
         data = json.loads(Path(path).read_text())
-        if "foreground" in data:
-            self._fg_apply_config(ForegroundConfig(**data["foreground"]))
-        if "contours" in data:
-            self._ct_apply_config(ContoursConfig(**data["contours"]))
+        if "cp_contours" in data:
+            self._cp_ct_apply_config(CellposeContoursConfig(**data["cp_contours"]))
         if "tracking" in data:
             self._tr_apply_config(TrackingConfig(**data["tracking"]))
