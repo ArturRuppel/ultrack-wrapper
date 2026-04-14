@@ -5,7 +5,7 @@ from __future__ import annotations
 from qtpy.QtWidgets import QLabel, QTabWidget, QVBoxLayout, QWidget
 
 from ultrack_wrapper._widget_data_prep import DataPrepWidget
-from ultrack_wrapper.widgets import CellposeWidget, UltrackAnalysisWidget
+from ultrack_wrapper.widgets import CellposeWidget, FlowWatershedWidget, UltrackAnalysisWidget
 
 
 class UltrackWidget(QTabWidget):
@@ -18,6 +18,7 @@ class UltrackWidget(QTabWidget):
         self.addTab(DataPrepWidget(napari_viewer), "Data Prep")
         self.addTab(CellposeWidget(napari_viewer), "Cellpose")
         self.addTab(UltrackAnalysisWidget(napari_viewer), "Analysis")
+        self.addTab(FlowWatershedWidget(napari_viewer), "Flow Watershed")
         self.addTab(self._make_placeholder("Post-processing"), "Post-proc")
 
     @staticmethod

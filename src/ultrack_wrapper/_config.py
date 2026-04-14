@@ -31,6 +31,15 @@ class CellposeConfig(BaseModel):
 
 
 
+class FlowWatershedConfig(BaseModel):
+    """Parameters for flow-guided watershed cell segmentation (s02)."""
+
+    flow_scale: float = 1.0
+    cellpose_prob_threshold: float = 0.0
+    flow_smoothing_sigma: float = 0.0
+    method: str = "distance"  # "distance" (fast) or "iterative"
+
+
 class CellposeContoursConfig(BaseModel):
     """Parameters for cellpose-native contour generation (s02c).
 
@@ -83,5 +92,6 @@ class ProjectConfig(BaseModel):
 
     dataset: DatasetConfig
     cellpose: CellposeConfig = CellposeConfig()
+    flow_watershed: FlowWatershedConfig = FlowWatershedConfig()
     cp_contours: CellposeContoursConfig = CellposeContoursConfig()
     tracking: TrackingConfig = TrackingConfig()

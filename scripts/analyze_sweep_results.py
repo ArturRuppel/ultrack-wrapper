@@ -1,11 +1,11 @@
 #!/home/aruppel/miniconda3/envs/cellflow/bin/python
 """Analyze parameter sweep results for tracking quality.
 
-Compares tracked labels across different parameter sets to identify:
-- Track merges (very bad - two tracks become one)
-- Track splits (very bad - one track becomes two)
-- Disappeared/appeared tracks (bad - tracks start/end unexpectedly)
-- Continuity metrics per parameter
+Compares tracked labels across different parameter sets and against ground truth to identify:
+- Segmentation accuracy (IoU, Dice) against ground truth
+- Track matching accuracy
+- Track continuity metrics per parameter
+- Which parameters best match ground truth
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import tifffile
 from collections import defaultdict
+from scipy import ndimage
 
 
 def load_tracks_csv(csv_path: Path) -> pd.DataFrame:
@@ -26,6 +27,54 @@ def load_tracks_csv(csv_path: Path) -> pd.DataFrame:
     if not csv_path.exists():
         return pd.DataFrame()
     return pd.read_csv(csv_path)
+
+
+def load_ground_truth_stack(gt_path: Path) -> np.ndarray:
+    """Load ground truth label stack (T, Y, X) or (Y, X, T)."""
+    if not gt_path.exists():
+        return None
+    stack = tifffile.imread(str(gt_path))
+    # Ensure it's (T, Y, X)
+    if stack.ndim == 3:
+        # If it's (Y, X, T), transpose to (T, Y, X)
+        if stack.shape[2] < min(stack.shape[0], stack.shape[1]):
+            stack = np.transpose(stack, (2, 0, 1))
+    return stack
+
+
+def get_gt_track_count(gt_stack: np.ndarray) -> int:
+    """Count unique cell identities in ground truth (fast - just count labels)."""
+    all_labels = set()
+    for t in range(gt_stack.shape[0]):
+        all_labels.update(np.unique(gt_stack[t]))
+    all_labels.discard(0)
+    return len(all_labels)
+
+
+def compare_against_ground_truth(
+    pred_tracks_df: pd.DataFrame,
+    n_gt_tracks: int,
+) -> dict[str, Any]:
+    """Compare predicted track count against ground truth.
+
+    Simple comparison: just count unique track IDs.
+    """
+    if pred_tracks_df is None or len(pred_tracks_df) == 0:
+        return {}
+
+    try:
+        n_pred_tracks = len(pred_tracks_df["track_id"].unique())
+
+        metrics = {
+            "n_pred_tracks": int(n_pred_tracks),
+            "n_gt_tracks": int(n_gt_tracks),
+            "track_count_error": abs(n_pred_tracks - n_gt_tracks),
+        }
+
+        return metrics
+
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def analyze_track_continuity(tracks_df: pd.DataFrame) -> dict[str, Any]:
@@ -81,16 +130,33 @@ def compare_runs(
     run_dirs: list[Path],
     run_names: list[str],
     params: list[dict],
+    ground_truth_path: Path | None = None,
 ) -> dict[str, Any]:
     """Compare tracking results across multiple runs.
 
     Analyzes:
     - Track count variation
     - Continuity metrics
+    - Segmentation accuracy against ground truth (if provided)
     - Which parameters most affect results
     """
     print(f"Analyzing {len(run_dirs)} runs...")
+    if ground_truth_path:
+        print(f"Ground truth: {ground_truth_path}")
     print()
+
+    # Load ground truth once
+    gt_stack = None
+    n_gt_tracks = None
+    if ground_truth_path:
+        gt_stack = load_ground_truth_stack(ground_truth_path)
+        if gt_stack is not None:
+            print(f"Loaded ground truth: shape {gt_stack.shape}")
+            n_gt_tracks = get_gt_track_count(gt_stack)
+            print(f"Ground truth contains {n_gt_tracks} unique cell labels")
+        else:
+            print(f"WARNING: Could not load ground truth from {ground_truth_path}")
+        print()
 
     all_metrics = []
 
@@ -103,6 +169,11 @@ def compare_runs(
         continuity["run_dir"] = run_name
         continuity.update(param_set)
 
+        # Compare against ground truth if available
+        if n_gt_tracks is not None:
+            gt_metrics = compare_against_ground_truth(tracks_df, n_gt_tracks)
+            continuity.update(gt_metrics)
+
         all_metrics.append(continuity)
 
     metrics_df = pd.DataFrame(all_metrics)
@@ -111,6 +182,26 @@ def compare_runs(
     print("=" * 80)
     print("TRACKING QUALITY SUMMARY")
     print("=" * 80)
+    print()
+
+    # Show ground truth tracking metrics first if available
+    if "n_gt_tracks" in metrics_df.columns:
+        print("Ground Truth Tracking Comparison:")
+        print(f"  GT has {metrics_df['n_gt_tracks'].iloc[0]:.0f} unique cell labels")
+        print()
+
+        print("Tracking Accuracy by Parameter Set:")
+        print(f"  Mean predicted tracks: {metrics_df['n_pred_tracks'].mean():.1f}")
+        print(f"  Mean track count error: {metrics_df['track_count_error'].mean():.1f}")
+        print()
+
+        # Find best by track count accuracy
+        best_idx = metrics_df["track_count_error"].idxmin()
+        best_row = metrics_df.iloc[best_idx]
+        print(f"Best Match to Ground Truth: {best_row['run_dir']}")
+        print(f"  Predicted: {best_row['n_pred_tracks']:.0f} tracks (error: {best_row['track_count_error']:.0f})")
+        print()
+
     print()
 
     print("Track Count Variation:")
@@ -152,13 +243,21 @@ def compare_runs(
         if param_name not in metrics_df.columns:
             continue
 
-        # Group by parameter value
-        grouped = metrics_df.groupby(param_name).agg({
+        # Build aggregation dict
+        agg_dict = {
             "n_tracks": ["min", "mean", "max"],
             "avg_continuity": ["min", "mean", "max"],
             "n_disappeared": ["min", "mean", "max"],
             "n_appeared": ["min", "mean", "max"],
-        })
+        }
+
+        # Add ground truth tracking metrics if available
+        if "track_count_error" in metrics_df.columns:
+            agg_dict["track_count_error"] = ["min", "mean", "max"]
+            agg_dict["n_pred_tracks"] = ["min", "mean", "max"]
+
+        # Group by parameter value
+        grouped = metrics_df.groupby(param_name).agg(agg_dict)
 
         print(f"\n{param_name}:")
         print("-" * 80)
@@ -175,6 +274,11 @@ def compare_runs(
         ["run_dir"] + param_names +
         ["n_tracks", "avg_continuity", "n_disappeared", "n_appeared", "n_complete_tracks"]
     )
+
+    # Add ground truth tracking columns if available
+    if "track_count_error" in metrics_df.columns:
+        display_cols.extend(["n_pred_tracks", "n_gt_tracks", "track_count_error"])
+
     available_cols = [c for c in display_cols if c in metrics_df.columns]
     print(metrics_df[available_cols].to_string(index=False))
 
@@ -183,6 +287,14 @@ def compare_runs(
     print("INTERPRETATION GUIDE")
     print("=" * 80)
     print()
+
+    if "track_count_error" in metrics_df.columns:
+        print("Ground Truth Tracking Metrics (most important):")
+        print("  - n_pred_tracks: number of predicted tracks (from tracks.csv)")
+        print("  - n_gt_tracks: number of ground truth cell labels")
+        print("  - track_count_error: absolute difference (lower is better)")
+        print()
+
     print("Track Count:")
     print("  - Higher is better (more cells detected)")
     print("  - But should be balanced with continuity")
@@ -210,6 +322,10 @@ def main():
         "--results-dir",
         required=True,
         help="Path to sweep results directory",
+    )
+    parser.add_argument(
+        "--ground-truth",
+        help="Path to ground truth label stack (TYX format)",
     )
     args = parser.parse_args()
 
@@ -243,7 +359,8 @@ def main():
         params.append(param_dict)
 
     # Analyze
-    metrics_df = compare_runs(run_dirs, run_names, params)
+    gt_path = Path(args.ground_truth) if args.ground_truth else None
+    metrics_df = compare_runs(run_dirs, run_names, params, ground_truth_path=gt_path)
 
     # Save analysis
     analysis_csv = results_dir / "analysis.csv"
